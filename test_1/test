@@ -1,20 +1,39 @@
 # predict.py
-import spacy
-from pathlib import Path
+from flair.models import SequenceTagger
+from flair.data import Sentence
+from razdel import tokenize
+import sys
 
-# Константы
-MODEL_PATH = "ner_model"
-TEST_FILE_PATH = "test_text.txt"  # путь к вашему тестовому .txt файлу
+# === КОНСТАНТЫ ===
+MODEL_PATH = "ner_model/final-model.pt"
+TEST_FILE = "test.txt"  # замените на нужный путь
 
-def predict_entities(file_path, model_path):
-    nlp = spacy.load(model_path)
-    with open(file_path, "r", encoding="utf-8") as f:
+def text_to_sentence(text: str) -> Sentence:
+    """Преобразует текст в Sentence с токенизацией через razdel."""
+    tokens = [t.text for t in tokenize(text)]
+    sentence = Sentence()
+    for token in tokens:
+        sentence.add_token(token)
+    return sentence
+
+def main():
+    # Загружаем модель
+    tagger = SequenceTagger.load(MODEL_PATH)
+
+    # Читаем тестовый файл
+    with open(TEST_FILE, "r", encoding="utf-8") as f:
         text = f.read()
 
-    doc = nlp(text)
-    print(f"\nРезультаты для {file_path}:\n")
-    for ent in doc.ents:
-        print(f"[{ent.label_}] {ent.text} (позиции {ent.start_char}-{ent.end_char})")
+    # Создаём предложение
+    sentence = text_to_sentence(text)
+
+    # Предсказание
+    tagger.predict(sentence)
+
+    # Вывод результатов
+    print(f"\n🔍 Результаты для файла: {TEST_FILE}\n")
+    for entity in sentence.get_spans("ner"):
+        print(f"[{entity.tag}] {entity.text} (уверенность: {entity.score:.3f})")
 
 if __name__ == "__main__":
-    predict_entities(TEST_FILE_PATH, MODEL_PATH)
+    main()
