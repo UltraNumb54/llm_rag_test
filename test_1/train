@@ -1,56 +1,59 @@
-# train_ner.py
-import spacy
-from spacy.training import Example
-import random
-import json
-from pathlib import Path
+# train.py
+from flair.data import Corpus
+from flair.datasets import ColumnCorpus
+from flair.embeddings import (
+    WordEmbeddings,
+    FlairEmbeddings,
+    StackedEmbeddings
+)
+from flair.models import SequenceTagger
+from flair.trainers import ModelTrainer
 
-# Константы
-TRAIN_DATA_PATH = "train_data.json"
-MODEL_OUTPUT_DIR = "ner_model"
-N_ITER = 30  # количество эпох
+# === КОНСТАНТЫ ===
+DATA_FOLDER = "."                   # где лежит train.conll
+COLUMN_FORMAT = {0: "text", 1: "ner"}
+MODEL_DIR = "ner_model"
+EPOCHS = 20
+LEARNING_RATE = 0.1
+BATCH_SIZE = 8
 
-def load_training_data(path):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return [(text, annot) for text, annot in data]
+def main():
+    # Загружаем корпус
+    corpus: Corpus = ColumnCorpus(
+        data_folder=DATA_FOLDER,
+        column_format=COLUMN_FORMAT,
+        train_file="train.conll"
+    )
 
-def train_model():
-    # Загружаем базовую русскую модель
-    nlp = spacy.load("ru_core_news_sm")
-    
-    # Получаем NER-компонент
-    if "ner" not in nlp.pipe_names:
-        ner = nlp.add_pipe("ner")
-    else:
-        ner = nlp.get_pipe("ner")
+    # Эмбеддинги: мультиязычные + контекстуальные Flair
+    embeddings = StackedEmbeddings([
+        WordEmbeddings("multi"),           # FastText multilingual
+        FlairEmbeddings("multi-forward"),  # контекст вперёд
+        FlairEmbeddings("multi-backward")  # контекст назад
+    ])
 
-    # Добавляем метки
-    train_data = load_training_data(TRAIN_DATA_PATH)
-    for _, annotations in train_data:
-        for ent in annotations.get("entities", []):
-            ner.add_label(ent[2])  # ent[2] = label
+    # Создаём теггер
+    tagger = SequenceTagger(
+        hidden_size=256,
+        embeddings=embeddings,
+        tag_dictionary=corpus.make_tag_dictionary(tag_type="ner"),
+        tag_type="ner",
+        use_crf=True
+    )
 
-    # Отключаем другие компоненты на время обучения
-    pipe_exceptions = ["ner", "trf_wordpiecer", "trf_tok2vec"]
-    unaffected_pipes = [pipe for pipe in nlp.pipe_names if pipe not in pipe_exceptions]
+    # Обучаем
+    trainer = ModelTrainer(tagger, corpus)
+    trainer.train(
+        MODEL_DIR,
+        learning_rate=LEARNING_RATE,
+        mini_batch_size=BATCH_SIZE,
+        max_epochs=EPOCHS,
+        embeddings_storage_mode="cpu",
+        checkpoint=False,
+        param_selection_mode=False
+    )
 
-    with nlp.disable_pipes(*unaffected_pipes):
-        optimizer = nlp.begin_training()
-        for i in range(N_ITER):
-            random.shuffle(train_data)
-            losses = {}
-            for text, annotations in train_data:
-                example = Example.from_dict(nlp.make_doc(text), annotations)
-                nlp.update([example], drop=0.5, losses=losses)
-            print(f"Эпоха {i+1}, потери: {losses}")
-
-    # Сохраняем модель
-    output_dir = Path(MODEL_OUTPUT_DIR)
-    if not output_dir.exists():
-        output_dir.mkdir()
-    nlp.to_disk(output_dir)
-    print(f"Модель сохранена в {MODEL_OUTPUT_DIR}")
+    print(f"✅ Модель сохранена в папку {MODEL_DIR}")
 
 if __name__ == "__main__":
-    train_model()
+    main()
