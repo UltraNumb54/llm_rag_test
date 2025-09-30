@@ -1,0 +1,54 @@
+# spaCy v3+ с обучением кастомной NER-модели
+
+pip install spacy pandas
+python -m spacy download ru_core_news_sm  # русская модель для инициализации
+
+# prepare_data.py
+import pandas as pd
+import json
+import os
+
+# Константы — пути к файлам
+CSV_PATH = "your_annotations.csv"          # замените на путь к вашему CSV
+TEXTS_DIR = "/data/upload/1/"              # директория с .txt файлами
+OUTPUT_PATH = "train_data.json"            # выходной файл для обучения
+
+def read_text_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+def convert_labelstudio_to_spacy(csv_path, texts_dir):
+    df = pd.read_csv(csv_path)
+    training_data = []
+
+    for _, row in df.iterrows():
+        text_path = os.path.join(texts_dir, os.path.basename(row["text"]))
+        try:
+            text = read_text_file(text_path)
+        except Exception as e:
+            print(f"Ошибка чтения {text_path}: {e}")
+            continue
+
+        annotations = json.loads(row["label"])
+        entities = []
+        for ann in annotations:
+            start = ann["start"]
+            end = ann["end"]
+            label = ann["labels"][0]  # берем первый (и обычно единственный) лейбл
+            # Проверка корректности спана
+            if end <= len(text):
+                entities.append((start, end, label))
+            else:
+                print(f"Некорректный спан в {text_path}: {start}-{end} (текст длиной {len(text)})")
+
+        training_data.append((text, {"entities": entities}))
+
+    return training_data
+
+if __name__ == "__main__":
+    data = convert_labelstudio_to_spacy(CSV_PATH, TEXTS_DIR)
+    # Сохраняем в JSON для удобства
+    import json
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"Данные сохранены в {OUTPUT_PATH}, всего примеров: {len(data)}")
