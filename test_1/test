@@ -1,0 +1,20 @@
+# predict.py
+import spacy
+from pathlib import Path
+
+# Константы
+MODEL_PATH = "ner_model"
+TEST_FILE_PATH = "test_text.txt"  # путь к вашему тестовому .txt файлу
+
+def predict_entities(file_path, model_path):
+    nlp = spacy.load(model_path)
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    doc = nlp(text)
+    print(f"\nРезультаты для {file_path}:\n")
+    for ent in doc.ents:
+        print(f"[{ent.label_}] {ent.text} (позиции {ent.start_char}-{ent.end_char})")
+
+if __name__ == "__main__":
+    predict_entities(TEST_FILE_PATH, MODEL_PATH)
