@@ -1,0 +1,56 @@
+# train_ner.py
+import spacy
+from spacy.training import Example
+import random
+import json
+from pathlib import Path
+
+# Константы
+TRAIN_DATA_PATH = "train_data.json"
+MODEL_OUTPUT_DIR = "ner_model"
+N_ITER = 30  # количество эпох
+
+def load_training_data(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return [(text, annot) for text, annot in data]
+
+def train_model():
+    # Загружаем базовую русскую модель
+    nlp = spacy.load("ru_core_news_sm")
+    
+    # Получаем NER-компонент
+    if "ner" not in nlp.pipe_names:
+        ner = nlp.add_pipe("ner")
+    else:
+        ner = nlp.get_pipe("ner")
+
+    # Добавляем метки
+    train_data = load_training_data(TRAIN_DATA_PATH)
+    for _, annotations in train_data:
+        for ent in annotations.get("entities", []):
+            ner.add_label(ent[2])  # ent[2] = label
+
+    # Отключаем другие компоненты на время обучения
+    pipe_exceptions = ["ner", "trf_wordpiecer", "trf_tok2vec"]
+    unaffected_pipes = [pipe for pipe in nlp.pipe_names if pipe not in pipe_exceptions]
+
+    with nlp.disable_pipes(*unaffected_pipes):
+        optimizer = nlp.begin_training()
+        for i in range(N_ITER):
+            random.shuffle(train_data)
+            losses = {}
+            for text, annotations in train_data:
+                example = Example.from_dict(nlp.make_doc(text), annotations)
+                nlp.update([example], drop=0.5, losses=losses)
+            print(f"Эпоха {i+1}, потери: {losses}")
+
+    # Сохраняем модель
+    output_dir = Path(MODEL_OUTPUT_DIR)
+    if not output_dir.exists():
+        output_dir.mkdir()
+    nlp.to_disk(output_dir)
+    print(f"Модель сохранена в {MODEL_OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    train_model()
