@@ -1,3 +1,6 @@
+
+----------------
+
 vllm serve Qwen/Qwen3-8B --gpu-memory-utilization 0.85 --max-model-len 8192
 диск: ~/.cache/huggingface/hub/
 # В терминале WSL2
