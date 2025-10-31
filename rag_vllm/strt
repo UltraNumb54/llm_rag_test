@@ -1,0 +1,38 @@
+# Ячейка 1: Установка зависимостей
+!pip install -r requirements.txt
+
+# Ячейка 2: Запуск сервера
+import subprocess
+import threading
+import time
+
+def start_server():
+    subprocess.run(["python", "start_server.py"])
+
+# Запуск в отдельном потоке
+server_thread = threading.Thread(target=start_server)
+server_thread.daemon = True
+server_thread.start()
+
+print("Сервер запускается...")
+time.sleep(5)
+
+# Ячейка 3: Тестирование
+from app.services.llm_service import LLMService
+from app.services.embedding_service import EmbeddingService
+
+# Тест LLM
+llm = LLMService()
+print("LLM подключен:", llm.check_connection())
+
+# Тест эмбеддингов
+embedder = EmbeddingService()
+test_text = "Тестовый текст"
+embedding = embedder.encode([test_text])
+print(f"Размер эмбеддинга: {len(embedding[0])}")
+
+# Ячейка 4: Быстрый тест API
+import requests
+
+response = requests.get("http://localhost:8000/health")
+print("Статус здоровья:", response.json())
