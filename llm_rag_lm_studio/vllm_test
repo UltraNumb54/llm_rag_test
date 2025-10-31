@@ -1,0 +1,16 @@
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:8000/v1"
+)
+
+chat_response = client.chat.completions.create(
+    model="Qwen/Qwen3-8B",
+    messages=[
+        {"role": "user", "content": "Напиши короткое стихотворение про искусственный интеллект."}
+    ],
+    max_tokens=150,
+)
+
+print("Ответ модели:", chat_response.choices[0].message.content)
