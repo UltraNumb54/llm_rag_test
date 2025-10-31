@@ -1,0 +1,12 @@
+rag_system/
+├── app/
+│ ├── init.py
+│ ├── main.py
+│ ├── static/
+│ │ ├── index.html
+│ │ └── style.css
+│ ├── rag_pipeline.py
+│ └── config.py
+├── requirements.txt
+├── start_server.py
+└── test_api.py
