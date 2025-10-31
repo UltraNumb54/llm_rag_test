@@ -1,0 +1,14 @@
+# Запуск Open WebUI с ограничениями
+docker run -d \
+  --name openwebui \
+  -p 3000:8080 \
+  -e OLLAMA_BASE_URLS=http://your-rag-api:8000 \
+  -e WEBUI_NAME="RAG Чат" \
+  -e WEBUI_AUTH=False \
+  -e DEFAULT_MODEL=rag-model \
+  -e DISABLE_MODEL_SELECTION=true \
+  -e DISABLE_SETTINGS=true \
+  -e DISABLE_USER_SETTINGS=true \
+  -e DISABLE_MODEL_SETTINGS=true \
+  --restart always \
+  ghcr.io/open-webui/open-webui:main
