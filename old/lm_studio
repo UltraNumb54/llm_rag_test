@@ -1,3 +1,191 @@
+import chromadb
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch
+import logging
+from openai import OpenAI
+import os
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Используется устройство: {device}")
+
+# Инициализация ChromaDB
+def initialize_chroma_client():
+    try:
+        client = chromadb.PersistentClient(path="./chroma_db")
+        collections = client.list_collections()
+        logger.info(f"Успешное подключение. Коллекций: {len(collections)}")
+        
+        try:
+            collection = client.get_collection(name="docs")
+            logger.info(f"Коллекция 'docs' загружена. Документов: {collection.count()}")
+        except Exception:
+            logger.info("Создание новой коллекции 'docs'")
+            collection = client.create_collection(name="docs")
+            
+        return client, collection
+        
+    except Exception as e:
+        logger.error(f"Ошибка инициализации ChromaDB: {e}")
+        raise
+
+chroma_client, collection = initialize_chroma_client()
+
+# Модели для эмбеддингов и реранкинга
+embedding_model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+reranker_model_name = "Alibaba-NLP/gte-multilingual-reranker-base"
+tokenizer = AutoTokenizer.from_pretrained(reranker_model_name)
+reranker = AutoModelForSequenceClassification.from_pretrained(
+    reranker_model_name, 
+    trust_remote_code=True,
+    torch_dtype=torch.float16
+).to(device)
+reranker.eval()
+
+# Клиент для LM Studio
+lm_client = OpenAI(
+    base_url="http://26.25.60.34:1234/v1",
+    api_key="not-needed"
+)
+
+def generate_embeddings(texts):
+    return embedding_model.encode(texts, convert_to_tensor=True).cpu().numpy()
+
+def search_with_detailed_logging(query, top_k=10, rerank_top_k=5):
+    print(f"\n=== ПОИСК: '{query}' ===")
+    
+    print("1. Генерация эмбеддинга запроса...")
+    query_embedding = generate_embeddings([query])[0]
+    
+    print(f"2. Векторный поиск (top_k={top_k})...")
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k
+    )
+    
+    if not results['documents']:
+        print("Не найдено документов")
+        return []
+    
+    documents = results['documents'][0]
+    metadatas = results['metadatas'][0]
+    distances = results['distances'][0] if 'distances' in results else [None] * len(documents)
+    
+    print("\n3. РЕЗУЛЬТАТЫ ВЕКТОРНОГО ПОИСКА:")
+    print("-" * 50)
+    for i, (doc, meta, dist) in enumerate(zip(documents, metadatas, distances)):
+        print(f"{i+1}. [Расстояние: {dist:.4f}] Источник: {meta['source']}")
+        print(f"   Фрагмент: {doc[:100]}...")
+        print()
+    
+    print("4. Реранкинг с cross-encoder...")
+    pairs = [(query, doc) for doc in documents]
+    
+    with torch.no_grad():
+        inputs = tokenizer(pairs, padding=True, truncation=True, 
+                          return_tensors='pt', max_length=512).to(device)
+        scores = reranker(**inputs, return_dict=True).logits.view(-1, ).float()
+        rerank_scores = scores.cpu().numpy()
+    
+    combined_results = list(zip(documents, metadatas, distances, rerank_scores))
+    combined_results.sort(key=lambda x: x[3], reverse=True)
+    
+    print("\n5. РЕЗУЛЬТАТЫ ПОСЛЕ РЕРАНКИНГА:")
+    print("-" * 50)
+    for i, (doc, meta, dist, score) in enumerate(combined_results[:rerank_top_k]):
+        print(f"{i+1}. [Реранк: {score:.4f}] [Вектор: {dist:.4f}] Источник: {meta['source']}")
+        print(f"   Фрагмент: {doc[:100]}...")
+        print()
+    
+    return combined_results[:rerank_top_k]
+
+def ask_llm(question, context_documents, model="local-model"):
+    """Генерация ответа от LLM на основе найденных документов"""
+    print("\n6. ГЕНЕРАЦИЯ ОТВЕТА ОТ LLM...")
+    
+    # Собираем контекст из найденных документов
+    context = "\n\n".join([f"Источник: {doc[1]['source']}\nСодержание: {doc[0]}" 
+                          for doc in context_documents])
+    
+    prompt = f"""Используй только приведённый ниже контекст для ответа на вопрос. 
+Если в контексте нет информации для ответа, скажи "В предоставленных документах нет информации для ответа на этот вопрос".
+
+Контекст:
+{context}
+
+Вопрос: {question}
+
+Ответ:"""
+    
+    try:
+        print("Отправка запроса к LM Studio...")
+        response = lm_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Ты - полезный ассистент, который отвечает на вопросы на основе предоставленного контекста."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=500,
+        )
+        
+        answer = response.choices[0].message.content
+        print("Ответ успешно сгенерирован")
+        return answer
+        
+    except Exception as e:
+        error_msg = f"Ошибка при запросе к LM Studio: {e}"
+        logger.error(error_msg)
+        return error_msg
+
+def full_rag_pipeline(query, top_k=10, rerank_top_k=3):
+    """Полный RAG пайплайн: поиск + реранкинг + генерация ответа"""
+    
+    # Поиск и реранкинг
+    search_results = search_with_detailed_logging(query, top_k, rerank_top_k)
+    
+    if not search_results:
+        return "К сожалению, в моих документах нет информации для ответа на этот вопрос."
+    
+    # Генерация ответа от LLM
+    final_results = [(doc, meta, score) for doc, meta, dist, score in search_results]
+    answer = ask_llm(query, final_results)
+    
+    print("\n" + "="*70)
+    print("ФИНАЛЬНЫЙ ОТВЕТ:")
+    print("="*70)
+    print(answer)
+    print("="*70)
+    
+    return answer
+
+# Тестирование
+if __name__ == "__main__":
+    test_queries = [
+        "Что такое искусственный интеллект?",
+        # Добавьте свои тестовые запросы здесь
+    ]
+    
+    for query in test_queries:
+        full_rag_pipeline(query)
+
+# Простой вызов
+answer = full_rag_pipeline("Ваш вопрос здесь")
+
+# С кастомными параметрами
+answer = full_rag_pipeline(
+    query="Сложный вопрос", 
+    top_k=15, 
+    rerank_top_k=5
+)
+
+
+------------------------
 
 def rag_qa_pipeline(user_query):
     print(f"\nОбработка запроса: '{user_query}'")
