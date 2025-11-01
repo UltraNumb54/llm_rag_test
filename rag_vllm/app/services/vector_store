@@ -1,0 +1,56 @@
+import chromadb
+from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+class VectorStore:
+    def __init__(self):
+        try:
+            self.client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
+            self.collection = self.client.get_or_create_collection(
+                name=settings.COLLECTION_NAME,
+                metadata={"description": "RAG documents collection"}
+            )
+            logger.info(f"Vector store инициализирован: {settings.CHROMA_PATH}")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации vector store: {e}")
+            raise
+
+    def add_documents(self, embeddings, documents, metadatas, ids):
+        """Добавление документов в коллекцию"""
+        try:
+            self.collection.add(
+                embeddings=embeddings,
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids
+            )
+            logger.info(f"Добавлено {len(documents)} документов в коллекцию")
+        except Exception as e:
+            logger.error(f"Ошибка добавления документов: {e}")
+            raise
+
+    def search(self, query_embedding, n_results=10):
+        """Поиск похожих документов"""
+        try:
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results
+            )
+            return results
+        except Exception as e:
+            logger.error(f"Ошибка поиска: {e}")
+            raise
+
+    def count(self):
+        """Количество документов в коллекции"""
+        return self.collection.count()
+
+    def delete_collection(self):
+        """Удаление коллекции (для тестов)"""
+        try:
+            self.client.delete_collection(settings.COLLECTION_NAME)
+            logger.info("Коллекция удалена")
+        except Exception as e:
+            logger.error(f"Ошибка удаления коллекции: {e}")
