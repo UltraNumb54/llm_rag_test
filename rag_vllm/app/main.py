@@ -93,3 +93,79 @@ async def health_check():
             "vector_store": vector_store is not None
         }
     }
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+import logging
+from app.config import settings
+from app.api.endpoints import router as api_router
+from app.services.embedding_service import EmbeddingService
+from app.services.llm_service import LLMService
+from app.services.vector_store import VectorStore
+from app.utils.file_handlers import ensure_directory_exists
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Глобальные сервисы
+embedding_service = None
+llm_service = None
+vector_store = None
+
+app = FastAPI(
+    title="RAG Production System",
+    description="Продакшен-готовая RAG система",
+    version="1.0.0"
+)
+
+@app.on_event("startup")
+async def startup_event():
+    """Инициализация при запуске"""
+    global embedding_service, vector_store
+    
+    logger.info("Запуск RAG системы...")
+    
+    # Создание необходимых директорий
+    ensure_directory_exists(settings.CHROMA_PATH)
+    ensure_directory_exists("data/raw")
+    ensure_directory_exists("data/processed")
+    
+    try:
+        # Инициализация сервисов
+        embedding_service = EmbeddingService()
+        vector_store = VectorStore()
+        
+        # LLM сервис будет инициализирован через API /configure
+        
+        logger.info("✅ RAG система успешно запущена")
+        logger.info(f"📊 Документов в базе: {vector_store.count()}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска системы: {e}")
+        raise
+
+# Подключение API роутов
+app.include_router(api_router, prefix="/api/v1")
+
+# Обслуживание статических файлов (веб-интерфейс)
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+async def serve_interface():
+    """Главная страница с веб-интерфейсом"""
+    if os.path.exists("static/index.html"):
+        return FileResponse("static/index.html")
+    return {"message": "RAG System API", "docs": "/docs"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=True
+    )
