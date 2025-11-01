@@ -1,3 +1,39 @@
+
+def rag_qa_pipeline(user_query):
+    print(f"\nОбработка запроса: '{user_query}'")
+    
+    # Используем top_k=5 и rerank_top_k=3 как раньше, или измените по необходимости
+    search_results = search_with_reranking(user_query, top_k=5, rerank_top_k=3)
+    
+    if not search_results:
+        print("Поиск не вернул результатов.")
+        return "К сожалению, в моих документах нет информации для ответа на этот вопрос."
+    
+    print(f"--- Найдено {len(search_results)} релевантных фрагментов после rerank ---")
+    for idx, (doc, metadata, score) in enumerate(search_results):
+        print(f"  Результат {idx + 1} (Score: {score:.4f}):")
+        print(f"    Источник: {metadata.get('source', 'N/A')}")
+        print(f"    Фрагмент: {doc[:200]}...") # Выводим первые 200 символов фрагмента
+        print("-" * 20)
+    
+    # Формируем контекст из rerank'нутых результатов
+    context_documents = search_results # search_results уже содержит (doc, metadata, score)
+    
+    answer = ask_mistral(user_query, context_documents)
+    return answer
+
+# reranker = CrossEncoder(
+#     'cross-encoder/ms-marco-MiniLM-L-6-v2',
+#     max_length=512,
+#     device=device
+# )
+
+reranker = CrossEncoder(
+    'DiTy/cross-encoder-russian-msmarco',
+    max_length=512,
+    device=device
+)
+
 # LM Studio
 import os
 import torch
