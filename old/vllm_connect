@@ -46,9 +46,4 @@ if wait_for_server():
     # Тестируем
     print(ask_model("Привет! Ответь коротко - ты работаешь?"))
 else:
-    print("""
-Сервер vLLM не запущен. Запустите его в отдельном терминале:
-
-source ~/.venv/bin/activate
-vllm serve Qwen/Qwen3-8B --gpu-memory-utilization 0.85
-""")
+    print("Сервер vLLM не запущен")
