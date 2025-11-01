@@ -140,11 +140,11 @@ async def startup_event():
         
         # LLM сервис будет инициализирован через API /configure
         
-        logger.info("✅ RAG система успешно запущена")
-        logger.info(f"📊 Документов в базе: {vector_store.count()}")
+        logger.info("RAG система успешно запущена")
+        logger.info(f"Документов в базе: {vector_store.count()}")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка запуска системы: {e}")
+        logger.error(f"Ошибка запуска системы: {e}")
         raise
 
 # Подключение API роутов
@@ -169,3 +169,30 @@ if __name__ == "__main__":
         port=settings.PORT,
         reload=True
     )
+
+
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# Добавьте ЭТО в main.py после создания app
+app = FastAPI(...)
+
+# ↓↓↓ ВСЕГО 3 СТРОКИ ДОБАВЛЕНИЯ ↓↓↓
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+@app.get("/")
+async def serve_interface():
+    return FileResponse("app/static/index.html")
+# ↑↑↑ ВСЕГО 3 СТРОКИ ДОБАВЛЕНИЯ ↑↑↑
+
+# Все остальное остается как было
+@app.on_event("startup")
+async def startup_event():
+    # ваша существующая логика
+    pass
+
+# ваши существующие эндпоинты
+@app.post("/api/v1/ask")
+async def ask_question(...):
+    # существующий код
+    pass
