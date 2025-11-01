@@ -1,0 +1,9 @@
+import os
+
+def ensure_directory_exists(path: str):
+    """Создание директории если не существует"""
+    os.makedirs(path, exist_ok=True)
+
+def get_file_extension(file_path: str):
+    """Получение расширения файла"""
+    return os.path.splitext(file_path)[1].lower()
