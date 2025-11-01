@@ -1,0 +1,54 @@
+from openai import OpenAI
+import requests
+import time
+
+def check_server_ready():
+    try:
+        response = requests.get("http://localhost:8000/v1/models", timeout=5)
+        return response.status_code == 200
+    except:
+        return False
+
+def wait_for_server(timeout=60):
+    print("Ожидание запуска сервера vLLM...")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if check_server_ready():
+            print("✓ Сервер готов!")
+            return True
+        print(".", end="", flush=True)
+        time.sleep(2)
+    print("\nСервер не запустился за отведенное время")
+    return False
+
+# Ждем сервер перед подключением
+if wait_for_server():
+    client = OpenAI(
+        base_url="http://localhost:8000/v1",
+        api_key="none"
+    )
+    
+    def ask_model(question, max_tokens=500):
+        try:
+            response = client.chat.completions.create(
+                model="Qwen/Qwen2.5-7B-Instruct-AWQ",
+                messages=[
+                    {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке."},
+                    {"role": "user", "content": question}
+                ],
+                max_tokens=max_tokens,
+                temperature=0.7
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"Ошибка при запросе к модели: {e}"
+    
+    # Тестируем
+    print(ask_model("Привет! Ответь коротко - ты работаешь?"))
+else:
+    print("""
+Сервер vLLM не запущен. Запустите его в отдельном терминале:
+
+source ~/.venv/bin/activate
+vllm serve Qwen/Qwen3-8B --gpu-memory-utilization 0.85
+""")
