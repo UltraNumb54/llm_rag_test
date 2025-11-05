@@ -1,5 +1,6 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import ClassVar
 
 
 class Settings(BaseSettings):
@@ -28,7 +29,7 @@ class Settings(BaseSettings):
     API_KEY: str | None = None
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["*"])
 
-    model_config = SettingsConfigDict(env_file=".env")
+    model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(env_file=".env")
 
 
 settings = Settings()
