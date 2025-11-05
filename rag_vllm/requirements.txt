@@ -1,19 +1,20 @@
 
-fastapi==0.104.1
+fastapi==0.121.0
 uvicorn[standard]==0.24.0
-pydantic==2.5.0
-python-multipart==0.0.6
+pydantic==2.11.7
+python-multipart==0.0.20
 
 chromadb==0.4.15
 sentence-transformers==2.2.2
 torch>=2.0.0
 numpy>=1.21.0
+starlette==0.49.3
 
-openai==1.3.0
+openai==2.7.1
 requests==2.31.0
 
 langchain-text-splitters==0.0.1
-pypdf2>=3.0.0
+pypdf>=3.0.0
 python-docx>=1.1.0
 unstructured>=0.10.30
 
@@ -23,9 +24,6 @@ passlib[bcrypt]==1.7.4
 python-dotenv==1.0.0
 loguru==0.7.2
 psutil==5.9.6
-
-# Для управления процессами
 psutil==5.9.6
 
-# Для работы с путями
-pathlib2==2.3.7.post1
+pydantic-settings=2.11.0
