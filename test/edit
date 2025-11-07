@@ -1,41 +1,1807 @@
-def format_model_response(self, text: str) -> str:
-    """Форматирование ответа модели для корректного отображения в HTML"""
-    if not text:
-        return text
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Ассистент технической поддержки</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr 300px;
+            gap: 20px;
+            height: calc(100vh - 40px);
+        }
+
+        .chat-container {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .header {
+            background: #2c3e50;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 1.5em;
+            margin-bottom: 5px;
+        }
+
+        .header p {
+            opacity: 0.8;
+            font-size: 0.9em;
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            background: #f8f9fa;
+        }
+
+        .message {
+            margin-bottom: 15px;
+            padding: 12px 16px;
+            border-radius: 12px;
+            max-width: 80%;
+            animation: fadeIn 0.3s ease-in;
+            white-space: pre-wrap; /* Сохраняет переносы строк */
+            word-wrap: break-word;
+        }
+
+        .message.user {
+            background: #007bff;
+            color: white;
+            margin-left: auto;
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.assistant {
+            background: white;
+            border: 1px solid #e0e0e0;
+            margin-right: auto;
+            border-bottom-left-radius: 4px;
+        }
+
+        .message.system {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            margin: 10px auto;
+            max-width: 90%;
+            font-size: 0.9em;
+            text-align: center;
+        }
+
+        .message.error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+            margin: 10px auto;
+            max-width: 90%;
+        }
+
+        .message .message-content {
+            line-height: 1.5;
+        }
+
+        .message .message-content ul,
+        .message .message-content ol {
+            margin: 8px 0;
+            padding-left: 20px;
+        }
+
+        .message .message-content li {
+            margin: 4px 0;
+        }
+
+        .message .message-content code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }
+
+        .message .message-content pre {
+            background: #f8f8f8;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+
+        .input-area {
+            padding: 20px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+            display: flex;
+            gap: 10px;
+        }
+
+        .input-area input {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 25px;
+            font-size: 16px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        .input-area input:focus {
+            border-color: #007bff;
+        }
+
+        .input-area button {
+            padding: 12px 24px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+
+        .input-area button:hover {
+            background: #0056b3;
+        }
+
+        .input-area button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+
+        .sidebar {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .upload-section {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            border: 2px dashed #dee2e6;
+        }
+
+        .upload-section h3 {
+            margin-bottom: 10px;
+            color: #495057;
+        }
+
+        .upload-section input {
+            width: 100%;
+            margin-bottom: 10px;
+        }
+
+        .upload-section button {
+            width: 100%;
+            padding: 10px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        .upload-section button:hover {
+            background: #218838;
+        }
+
+        .status-section {
+            background: #e7f3ff;
+            padding: 15px;
+            border-radius: 10px;
+            border-left: 4px solid #007bff;
+        }
+
+        .status-section h3 {
+            margin-bottom: 10px;
+            color: #0056b3;
+        }
+
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            font-size: 0.9em;
+        }
+
+        .status-item .status {
+            font-weight: bold;
+        }
+
+        .status-item .status.healthy {
+            color: #28a745;
+        }
+
+        .status-item .status.error {
+            color: #dc3545;
+        }
+
+        .settings-section {
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 10px;
+            border-left: 4px solid #ffc107;
+        }
+
+        .settings-section h3 {
+            margin-bottom: 10px;
+            color: #856404;
+        }
+
+        .setting-item {
+            margin-bottom: 10px;
+        }
+
+        .setting-item label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.9em;
+            color: #856404;
+        }
+
+        .setting-item input[type="range"] {
+            width: 100%;
+        }
+
+        .setting-item .value-display {
+            text-align: center;
+            font-size: 0.8em;
+            color: #856404;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .typing-indicator {
+            display: inline-block;
+            padding: 12px 16px;
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 12px;
+            border-bottom-left-radius: 4px;
+            color: #666;
+            font-style: italic;
+        }
+
+        .typing-dots {
+            display: inline-block;
+        }
+
+        .typing-dots span {
+            animation: typing 1.4s infinite;
+            display: inline-block;
+        }
+
+        .typing-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes typing {
+            0%, 60%, 100% { opacity: 0.3; }
+            30% { opacity: 1; }
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar {
+                order: -1;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="chat-container">
+            <div class="header">
+                <h1>RAG Ассистент технической поддержки</h1>
+                <p>Задавайте вопросы на основе загруженных документов</p>
+            </div>
+
+            <div class="chat-messages" id="chat">
+                <div class="message system">
+                    Добро пожаловать! Загрузите документы и задавайте вопросы.
+                </div>
+            </div>
+
+            <div class="input-area">
+                <input type="text" id="message" placeholder="Введите ваш вопрос..." autocomplete="off">
+                <button onclick="sendMessage()" id="sendBtn">Отправить</button>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            <div class="upload-section">
+                <h3>Загрузка документов</h3>
+                <input type="file" id="fileInput" accept=".pdf,.docx,.txt,.md,.html,.rtf">
+                <button onclick="uploadFile()">Загрузить файл</button>
+                <div id="uploadStatus"></div>
+            </div>
+
+            <div class="settings-section">
+                <h3>Настройки поиска</h3>
+                <div class="setting-item">
+                    <label for="chunkCount">Количество чанков: <span id="chunkValue">5</span></label>
+                    <input type="range" id="chunkCount" min="1" max="15" value="5" onchange="updateChunkValue()">
+                </div>
+                <div class="setting-item">
+                    <label for="similarityThreshold">Порог схожести: <span id="similarityValue">0.6</span></label>
+                    <input type="range" id="similarityThreshold" min="0.1" max="0.9" step="0.1" value="0.6" onchange="updateSimilarityValue()">
+                </div>
+                <div class="setting-item">
+                    <label>
+                        <input type="checkbox" id="useReranking" checked>
+                        Использовать реранкинг
+                    </label>
+                </div>
+                <button onclick="applySettings()" style="width: 100%; padding: 8px; background: #ffc107; color: #856404; border: none; border-radius: 5px; cursor: pointer;">
+                    Применить настройки
+                </button>
+            </div>
+
+            <div class="status-section">
+                <h3>Статус системы</h3>
+                <div class="status-item">
+                    <span>RAG API:</span>
+                    <span class="status" id="apiStatus">Проверка...</span>
+                </div>
+                <div class="status-item">
+                    <span>LLM Сервис:</span>
+                    <span class="status" id="llmStatus">Проверка...</span>
+                </div>
+                <div class="status-item">
+                    <span>База данных:</span>
+                    <span class="status" id="dbStatus">Проверка...</span>
+                </div>
+                <div class="status-item">
+                    <span>Векторный поиск:</span>
+                    <span class="status" id="vectorStatus">Проверка...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let conversationId = 'conv-' + Date.now();
+        let currentSettings = {
+            chunkCount: 5,
+            similarityThreshold: 0.6,
+            useReranking: true
+        };
+
+        // Фокус на поле ввода при загрузке
+        document.getElementById('message').focus();
+
+        // Отправка по Enter
+        document.getElementById('message').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // Проверка статуса системы при загрузке
+        checkSystemStatus();
+
+        function updateChunkValue() {
+            const slider = document.getElementById('chunkCount');
+            const value = document.getElementById('chunkValue');
+            value.textContent = slider.value;
+        }
+
+        function updateSimilarityValue() {
+            const slider = document.getElementById('similarityThreshold');
+            const value = document.getElementById('similarityValue');
+            value.textContent = slider.value;
+        }
+
+        function applySettings() {
+            currentSettings = {
+                chunkCount: parseInt(document.getElementById('chunkCount').value),
+                similarityThreshold: parseFloat(document.getElementById('similarityThreshold').value),
+                useReranking: document.getElementById('useReranking').checked
+            };
+
+            addMessage('system', `Настройки применены: ${currentSettings.chunkCount} чанков, порог ${currentSettings.similarityThreshold}, реранкинг ${currentSettings.useReranking ? 'вкл' : 'выкл'}`);
+        }
+
+        function addMessage(role, content, isTyping = false) {
+            const chat = document.getElementById('chat');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+
+            if (isTyping) {
+                messageDiv.innerHTML = `
+                    <strong>Ассистент:</strong>
+                    <span class="typing-indicator">
+                        Обработка запроса
+                        <span class="typing-dots">
+                            <span>.</span><span>.</span><span>.</span>
+                        </span>
+                    </span>
+                `;
+            } else {
+                const roleNames = {
+                    'user': 'Вы',
+                    'assistant': 'Ассистент',
+                    'system': 'Система',
+                    'error': 'Ошибка'
+                };
+
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-content';
+                contentDiv.innerHTML = content; // Используем innerHTML для поддержки форматирования
+
+                messageDiv.innerHTML = `<strong>${roleNames[role]}:</strong>`;
+                messageDiv.appendChild(contentDiv);
+            }
+
+            chat.appendChild(messageDiv);
+            chat.scrollTop = chat.scrollHeight;
+            return messageDiv;
+        }
+
+        async function sendMessage() {
+            const messageInput = document.getElementById('message');
+            const sendBtn = document.getElementById('sendBtn');
+            const message = messageInput.value.trim();
+
+            if (!message) return;
+
+            // Добавляем сообщение пользователя
+            addMessage('user', message);
+            messageInput.value = '';
+            messageInput.disabled = true;
+            sendBtn.disabled = true;
+            sendBtn.textContent = 'Отправка...';
+
+            // Показываем индикатор набора
+            const typingIndicator = addMessage('assistant', '', true);
+
+            try {
+                const response = await fetch('/api/v1/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        message: message,
+                        conversation_id: conversationId,
+                        top_k: currentSettings.chunkCount,
+                        similarity_threshold: currentSettings.similarityThreshold,
+                        use_reranking: currentSettings.useReranking
+                    })
+                });
+
+                // Убираем индикатор набора
+                typingIndicator.remove();
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || `Ошибка HTTP: ${response.status}`);
+                }
+
+                const data = await response.json();
+                
+                // Форматируем ответ для корректного отображения
+                const formattedResponse = formatModelResponse(data.response);
+                addMessage('assistant', formattedResponse);
+
+                if (data.sources && data.sources.length > 0) {
+                    addMessage('system', `Использованные источники: ${data.sources.join(', ')}`);
+                }
+
+                if (data.search_metrics) {
+                    addMessage('system', 
+                        `Поисковые метрики: найдено ${data.search_metrics.found_chunks} чанков, ` +
+                        `использовано ${data.search_metrics.used_chunks}, ` +
+                        `средняя схожесть: ${data.search_metrics.avg_similarity.toFixed(2)}`
+                    );
+                }
+
+            } catch (error) {
+                // Убираем индикатор набора
+                typingIndicator.remove();
+                addMessage('error', `Ошибка соединения: ${error.message}`);
+            } finally {
+                messageInput.disabled = false;
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Отправить';
+                messageInput.focus();
+            }
+        }
+
+        function formatModelResponse(text) {
+            if (!text) return text;
+            
+            // Сохраняем переносы строк и базовое форматирование
+            let formatted = text
+                .replace(/\n/g, '<br>')
+                .replace(/\t/g, '&nbsp;&nbsp;&nbsp;&nbsp;')
+                .replace(/  /g, '&nbsp;&nbsp;');
+            
+            // Простое форматирование маркированных списков
+            formatted = formatted.replace(/^\s*[-•*]\s+/gm, '• ');
+            
+            // Форматирование кода (базовое)
+            formatted = formatted.replace(/`([^`]+)`/g, '<code>$1</code>');
+            
+            return formatted;
+        }
+
+        async function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const uploadStatus = document.getElementById('uploadStatus');
+            const file = fileInput.files[0];
+
+            if (!file) {
+                uploadStatus.innerHTML = '<span style="color: #dc3545;">Выберите файл</span>';
+                return;
+            }
+
+            // Проверка размера файла (10MB максимум)
+            if (file.size > 10 * 1024 * 1024) {
+                uploadStatus.innerHTML = '<span style="color: #dc3545;">Файл слишком большой (макс. 10MB)</span>';
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            uploadStatus.innerHTML = '<span style="color: #007bff;">Загрузка и обработка...</span>';
+
+            try {
+                const response = await fetch('/api/v1/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    uploadStatus.innerHTML = `<span style="color: #28a745;">${result.message}</span>`;
+                    fileInput.value = '';
+
+                    // Добавляем системное сообщение о успешной загрузке
+                    addMessage('system', 
+                        `Файл "${file.name}" успешно загружен и обработан. ` +
+                        `Создано ${result.chunks_created || 'неизвестно'} чанков.`
+                    );
+                } else {
+                    uploadStatus.innerHTML = `<span style="color: #dc3545;">Ошибка: ${result.detail || 'Неизвестная ошибка'}</span>`;
+                }
+            } catch (error) {
+                uploadStatus.innerHTML = `<span style="color: #dc3545;">Ошибка сети: ${error.message}</span>`;
+            }
+        }
+
+        async function checkSystemStatus() {
+            try {
+                const response = await fetch('/api/v1/health');
+                const data = await response.json();
+
+                if (response.ok) {
+                    document.getElementById('apiStatus').textContent = 'Работает';
+                    document.getElementById('apiStatus').className = 'status healthy';
+
+                    // Проверяем статусы компонентов
+                    const checks = data.checks || {};
+                    
+                    document.getElementById('llmStatus').textContent =
+                        checks.llm_service?.status === 'healthy' ? 'Работает' : 'Ошибка';
+                    document.getElementById('llmStatus').className =
+                        checks.llm_service?.status === 'healthy' ? 'status healthy' : 'status error';
+
+                    document.getElementById('dbStatus').textContent =
+                        checks.chromadb?.status === 'healthy' ? 'Работает' : 'Ошибка';
+                    document.getElementById('dbStatus').className =
+                        checks.chromadb?.status === 'healthy' ? 'status healthy' : 'status error';
+
+                    document.getElementById('vectorStatus').textContent =
+                        checks.vector_store?.status === 'healthy' ? 'Работает' : 'Ошибка';
+                    document.getElementById('vectorStatus').className =
+                        checks.vector_store?.status === 'healthy' ? 'status healthy' : 'status error';
+                }
+            } catch (error) {
+                document.getElementById('apiStatus').textContent = 'Ошибка';
+                document.getElementById('apiStatus').className = 'status error';
+                document.getElementById('llmStatus').textContent = 'Ошибка';
+                document.getElementById('llmStatus').className = 'status error';
+            }
+        }
+
+        // Инициализация значений слайдеров
+        updateChunkValue();
+        updateSimilarityValue();
+    </script>
+</body>
+</html>
+
+# rag_vllm_app/app/services/llm_service.py
+import time
+import re
+import json
+from typing import Dict, List, Optional, Tuple
+from app.config import settings
+from loguru import logger
+from openai import OpenAI
+
+
+class VLLMService:
+    def __init__(self):
+        self.client = OpenAI(
+            base_url=settings.LMSTUDIO_BASE_URL,
+            api_key=settings.LMSTUDIO_API_KEY
+        )
+        self.model_name = settings.LMSTUDIO_MODEL_NAME
+        self.max_retries = 3
+        self.retry_delay = 2
+        self.test_connection()
+
+    def test_connection(self):
+        """Тестирование подключения к VLLM серверу"""
+        logger.info(f"Проверка подключения к VLLM серверу: {settings.LMSTUDIO_BASE_URL}")
         
-    # Замена символов переноса и других специальных символов
-    formatted_text = (text
-        .replace('\n', '<br>')  # Переносы строк
-        .replace('\t', '    ')  # Табуляция
-        .replace('  ', '  ')   # Неразрывные пробелы
+        for attempt in range(self.max_retries):
+            try:
+                # Проверяем доступность сервера
+                models = self.client.models.list()
+                model_names = [model.id for model in models.data]
+                logger.info(f"Доступные модели в VLLM: {model_names}")
+
+                # Проверяем доступность целевой модели
+                if self.model_name not in model_names:
+                    available_model = model_names[0] if model_names else "unknown"
+                    logger.warning(
+                        f"Модель {self.model_name} не найдена. Доступные: {model_names}. "
+                        f"Используем первую доступную: {available_model}"
+                    )
+                    if model_names:
+                        self.model_name = available_model
+
+                # Тестовый запрос
+                test_response = self.generate("Ответь только 'OK'", max_tokens=5)
+                if "OK" in test_response.upper():
+                    logger.success(f"VLLM сервер подключен успешно. Используется модель: {self.model_name}")
+                else:
+                    logger.warning(f"Тестовый запрос вернул неожиданный ответ: {test_response}")
+                
+                return
+
+            except Exception as e:
+                logger.warning(
+                    f"Попытка {attempt + 1}/{self.max_retries}: Ошибка подключения к VLLM: {e}"
+                )
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                else:
+                    logger.error(
+                        f"Не удалось подключиться к VLLM серверу после {self.max_retries} попыток"
+                    )
+                    logger.info(
+                        "Убедитесь, что VLLM сервер запущен и доступен по адресу: " +
+                        settings.LMSTUDIO_BASE_URL
+                    )
+                    break
+
+    def format_model_response(self, text: str) -> str:
+        """
+        Форматирование ответа модели для корректного отображения в HTML
+        с сохранением структуры и форматирования
+        """
+        if not text:
+            return text
+        
+        # Сохраняем оригинальные переносы строк
+        formatted_text = text
+        
+        # Обработка маркированных списков
+        formatted_text = re.sub(r'^\s*[\-\*]\s+', '• ', formatted_text, flags=re.MULTILINE)
+        
+        # Обработка нумерованных списков
+        formatted_text = re.sub(r'^\s*(\d+)\.\s+', r'\1. ', formatted_text, flags=re.MULTILINE)
+        
+        # Обработка блоков кода (простая версия)
+        code_blocks = re.findall(r'```(?:\w+)?\n(.*?)\n```', formatted_text, re.DOTALL)
+        for code_block in code_blocks:
+            formatted_code = f"\n```\n{code_block}\n```\n"
+            formatted_text = formatted_text.replace(f"```\n{code_block}\n```", formatted_code)
+        
+        return formatted_text
+
+    def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.1,
+        max_tokens: int = 1024,
+        system_message: Optional[str] = None,
+        top_p: float = 0.9,
+        frequency_penalty: float = 0.1,
+        presence_penalty: float = 0.1
+    ) -> str:
+        """Генерация ответа через VLLM сервер"""
+        messages = []
+
+        if system_message:
+            messages.append({"role": "system", "content": system_message})
+
+        messages.append({"role": "user", "content": prompt})
+
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty,
+                    stream=False,
+                )
+                
+                result = response.choices[0].message.content.strip()
+                
+                # Логируем успешный запрос
+                logger.debug(f"VLLM запрос успешен. Получено {len(result)} символов")
+                
+                return result
+                
+            except Exception as e:
+                logger.warning(
+                    f"Попытка {attempt + 1}/{self.max_retries}: Ошибка генерации через VLLM: {e}"
+                )
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                else:
+                    logger.error(f"Все попытки генерации через VLLM завершились ошибкой: {e}")
+                    return f"Ошибка при обращении к модели: {str(e)}"
+
+    def generate_with_context(
+        self,
+        question: str,
+        context: List[str],
+        conversation_history: Optional[List[Dict]] = None,
+        search_metrics: Optional[Dict] = None
+    ) -> str:
+        """
+        Генерация ответа с контекстом RAG
+        с улучшенным промптом и обработкой форматов
+        """
+
+        # Базовый системный промпт
+        system_prompt = """Ты - полезный AI ассистент технической поддержки. Отвечай на вопросы пользователя 
+на основе предоставленного контекста из технической документации.
+
+Инструкции:
+1. Отвечай ТОЛЬКО на основе предоставленного контекста
+2. Если информации в контексте недостаточно, честно скажи об этом
+3. Используй четкую структуру в ответах: списки, абзацы, выделение важного
+4. Сохраняй технические термины и форматы как в контексте
+5. Если вопрос не по теме технической поддержки, вежливо отклони его"""
+
+        # Формируем контекст
+        context_text = ""
+        if context and len(context) > 0:
+            context_text = "КОНТЕКСТ ДЛЯ ОТВЕТА:\n\n"
+            for i, doc in enumerate(context[:5], 1):  # Ограничиваем количество чанков
+                context_text += f"[[Документ {i}]]\n{doc}\n\n"
+        
+        # Добавляем метрики поиска в контекст если есть
+        metrics_info = ""
+        if search_metrics:
+            metrics_info = f"\nИНФОРМАЦИЯ О ПОИСКЕ: Найдено {search_metrics.get('found_chunks', 0)} релевантных фрагментов, средняя релевантность: {search_metrics.get('avg_similarity', 0):.2f}"
+
+        # Формируем историю диалога
+        history_text = ""
+        if conversation_history:
+            # Берем только последние 4 обмена (8 сообщений)
+            recent_history = conversation_history[-8:]
+            history_text = "ПРЕДЫДУЩИЙ ДИАЛОГ:\n"
+            for msg in recent_history:
+                role = "Пользователь" if msg["role"] == "user" else "Ассистент"
+                history_text += f"{role}: {msg['content']}\n"
+            history_text += "\n"
+
+        # Собираем финальный промпт
+        user_prompt = f"""{history_text}{context_text}{metrics_info}
+
+ТЕКУЩИЙ ВОПРОС ПОЛЬЗОВАТЕЛЯ: {question}
+
+ПРАВИЛА ФОРМАТИРОВАНИЯ ОТВЕТА:
+- Используй четкие абзацы и списки где уместно
+- Сохраняй технические термины и спецификации точно
+- Если перечисляешь шаги, используй нумерованный список
+- Если даешь характеристики, используй маркированный список
+- Выделяй важные моменты
+- Сохраняй оригинальные названия функций, параметров, кодов ошибок
+
+ОТВЕТ АССИСТЕНТА:"""
+
+        messages = []
+        messages.append({"role": "system", "content": system_prompt})
+        
+        # Добавляем историю диалога как контекст
+        if conversation_history:
+            for msg in conversation_history[-6:]:  # Ограничиваем историю
+                messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        messages.append({"role": "user", "content": user_prompt})
+
+        try:
+            logger.debug(f"Отправка запроса к VLLM с контекстом из {len(context)} чанков")
+            
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.1,  # Низкая температура для детерминированных ответов
+                max_tokens=1024,
+                top_p=0.9,
+                frequency_penalty=0.1,
+                presence_penalty=0.1,
+                stream=False,
+            )
+
+            result = response.choices[0].message.content.strip()
+            
+            # Форматируем ответ для корректного отображения
+            formatted_result = self.format_model_response(result)
+            
+            logger.debug(f"Получен ответ от VLLM длиной {len(result)} символов")
+            
+            return formatted_result
+
+        except Exception as e:
+            logger.error(f"Ошибка при запросе к VLLM с контекстом: {e}")
+            return f"Извините, произошла ошибка при генерации ответа: {str(e)}"
+
+    def estimate_response_quality(
+        self, 
+        question: str, 
+        response: str, 
+        context: List[str]
+    ) -> Dict[str, float]:
+        """
+        Оценка качества ответа на основе различных метрик
+        """
+        quality_metrics = {
+            "relevance": 0.8,  # Релевантность вопросу
+            "completeness": 0.7,  # Полнота ответа
+            "context_usage": 0.6,  # Использование контекста
+            "clarity": 0.9  # Ясность изложения
+        }
+        
+        # Простая эвристическая оценка
+        if not response:
+            return {k: 0.0 for k in quality_metrics}
+            
+        # Оценка релевантности по наличию ключевых слов из вопроса
+        question_keywords = set(question.lower().split())
+        response_keywords = set(response.lower().split())
+        common_keywords = question_keywords.intersection(response_keywords)
+        if question_keywords:
+            quality_metrics["relevance"] = len(common_keywords) / len(question_keywords)
+        
+        # Оценка использования контекста
+        if context:
+            context_usage = 0
+            for ctx in context[:3]:  # Проверяем первые 3 чанка
+                ctx_keywords = set(ctx.lower().split()[:20])  # Берем первые 20 слов
+                if any(keyword in response.lower() for keyword in ctx_keywords):
+                    context_usage += 0.3
+            quality_metrics["context_usage"] = min(context_usage, 1.0)
+        
+        return quality_metrics
+
+
+# Глобальный экземпляр сервиса
+llm_service = VLLMService()
+
+# rag_vllm_app/app/config.py
+from typing import List, Optional, Dict, Any
+from pydantic import Field, validator
+from pydantic_settings import BaseSettings
+import os
+
+
+class Settings(BaseSettings):
+    """Настройки приложения с валидацией и типами для продакшена"""
+    
+    # Настройки сервера
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    WORKERS: int = 4
+    RELOAD: bool = False  # Для продакшена False
+    
+    # Модели для embedding и reranking
+    EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    
+    # Настройки VLLM сервера
+    VLLM_BASE_URL: str = "http://localhost:8000/v1"  # Изменено с LMSTUDIO_BASE_URL
+    VLLM_API_KEY: str = "none"
+    VLLM_MODEL_NAME: str = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+    
+    # Настройки базы данных
+    CHROMA_PATH: str = "./chroma_db"
+    COLLECTION_NAME: str = "tech_support_docs"
+    VECTOR_DIMENSION: int = 384  # Для multilingual-MiniLM-L12-v2
+    
+    # Настройки обработки документов
+    CHUNK_SIZE: int = 800
+    CHUNK_OVERLAP: int = 100
+    MAX_FILE_SIZE: int = 50 * 1024 * 1024  # 50MB
+    SUPPORTED_EXTENSIONS: List[str] = Field(
+        default_factory=lambda: [".pdf", ".docx", ".txt", ".md", ".html", ".rtf"]
     )
     
-    # Дополнительная обработка маркированных списков
-    formatted_text = re.sub(r'^\s*[\-\*]\s+', '• ', formatted_text, flags=re.MULTILINE)
+    # Настройки поиска и RAG
+    DEFAULT_TOP_K: int = 5
+    MAX_TOP_K: int = 15
+    DEFAULT_SIMILARITY_THRESHOLD: float = 0.6
+    RERANK_TOP_K: int = 3
+    MAX_CONTEXT_LENGTH: int = 3000  # Максимальная длина контекста для LLM
     
-    return formatted_text
+    # Настройки качества поиска
+    ENABLE_SEMANTIC_SEARCH: bool = True
+    ENABLE_RERANKING: bool = True
+    ENABLE_METRICS_LOGGING: bool = True
+    
+    # Безопасность и API
+    API_KEY: Optional[str] = None
+    CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
+    RATE_LIMIT_PER_MINUTE: int = 60
+    
+    # Настройки LLM
+    LLM_TEMPERATURE: float = 0.1
+    LLM_MAX_TOKENS: int = 1024
+    LLM_TOP_P: float = 0.9
+    LLM_FREQUENCY_PENALTY: float = 0.1
+    LLM_PRESENCE_PENALTY: float = 0.1
+    
+    # Настройки кэширования
+    ENABLE_CACHE: bool = True
+    CACHE_TTL: int = 3600  # 1 час
+    
+    # Мониторинг и логирование
+    LOG_LEVEL: str = "INFO"
+    ENABLE_METRICS: bool = True
+    METRICS_PORT: int = 9090
+    
+    # Настройки диалога
+    MAX_CONVERSATION_HISTORY: int = 10
+    CONVERSATION_TTL: int = 3600  # 1 час для хранения истории
+    
+    @validator("VLLM_BASE_URL")
+    def validate_vllm_url(cls, v):
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("VLLM_BASE_URL должен начинаться с http:// или https://")
+        return v
+    
+    @validator("CHUNK_SIZE")
+    def validate_chunk_size(cls, v):
+        if v < 100 or v > 2000:
+            raise ValueError("CHUNK_SIZE должен быть между 100 и 2000")
+        return v
+    
+    @validator("DEFAULT_SIMILARITY_THRESHOLD")
+    def validate_similarity_threshold(cls, v):
+        if v < 0.1 or v > 0.9:
+            raise ValueError("SIMILARITY_THRESHOLD должен быть между 0.1 и 0.9")
+        return v
+    
+    @validator("CORS_ORIGINS")
+    def validate_cors_origins(cls, v):
+        if "*" in v and len(v) > 1:
+            raise ValueError("CORS_ORIGINS не может содержать '*' вместе с другими origin")
+        return v
+    
+    @validator("VECTOR_DIMENSION")
+    def validate_vector_dimension(cls, v):
+        if v not in [384, 512, 768, 1024, 1536]:
+            raise ValueError("VECTOR_DIMENSION должен быть одним из стандартных значений: 384, 512, 768, 1024, 1536")
+        return v
 
-# метод generate_with_context:
-def generate_with_context(self, question: str, context: List[str], conversation_history: Optional[List[Dict]] = None) -> str:
-    # ... существующий код ...
-    result = response.choices[0].message.content.strip()
-    formatted_result = self.format_model_response(result)  # Добавьте эту строку
-    return formatted_result
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = False
+        validate_assignment = True
 
-function addMessage(role, content, isTyping = false) {
-    // ... существующий код ...
-    if (isTyping) {
-        // ... индикатор набора ...
-    } else {
-        const roleNames = {
-            'user': 'Вы',
-            'assistant': 'Ассистент', 
-            'system': 'Система',
-            'error': 'Ошибка'
-        };
+    def get_embedding_model_config(self) -> Dict[str, Any]:
+        """Конфигурация для модели эмбеддингов"""
+        return {
+            "model_name": self.EMBEDDING_MODEL,
+            "device": "cpu",  # Можно изменить на "cuda" если есть GPU
+            "normalize_embeddings": True
+        }
+    
+    def get_reranker_config(self) -> Dict[str, Any]:
+        """Конфигурация для реранкера"""
+        return {
+            "model_name": self.RERANKER_MODEL,
+            "device": "cpu"  # Можно изменить на "cuda" если есть GPU
+        }
+    
+    def get_llm_config(self) -> Dict[str, Any]:
+        """Конфигурация для LLM"""
+        return {
+            "base_url": self.VLLM_BASE_URL,
+            "model_name": self.VLLM_MODEL_NAME,
+            "temperature": self.LLM_TEMPERATURE,
+            "max_tokens": self.LLM_MAX_TOKENS,
+            "top_p": self.LLM_TOP_P,
+            "frequency_penalty": self.LLM_FREQUENCY_PENALTY,
+            "presence_penalty": self.LLM_PRESENCE_PENALTY
+        }
+    
+    def get_vector_store_config(self) -> Dict[str, Any]:
+        """Конфигурация для векторного хранилища"""
+        return {
+            "chroma_path": self.CHROMA_PATH,
+            "collection_name": self.COLLECTION_NAME,
+            "vector_dimension": self.VECTOR_DIMENSION,
+            "similarity_threshold": self.DEFAULT_SIMILARITY_THRESHOLD
+        }
+
+
+# Глобальный экземпляр настроек
+settings = Settings()
+
+# rag_vllm_app/app/routers/chat.py
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta
+import time
+import hashlib
+
+from app.config import settings
+from app.services.llm_service import llm_service
+from app.services.reranker import reranker_service
+from app.services.vector_store import vector_store
+from fastapi import APIRouter, HTTPException, Depends
+from loguru import logger
+from pydantic import BaseModel, Field, validator
+
+router = APIRouter()
+
+# In-memory хранилище диалогов (в продакшене заменить на Redis)
+conversation_store = {}
+conversation_metadata = {}
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000, description="Сообщение пользователя")
+    conversation_id: Optional[str] = Field(None, description="ID диалога для продолжения")
+    top_k: Optional[int] = Field(settings.DEFAULT_TOP_K, ge=1, le=settings.MAX_TOP_K, description="Количество чанков для поиска")
+    similarity_threshold: Optional[float] = Field(settings.DEFAULT_SIMILARITY_THRESHOLD, ge=0.1, le=0.9, description="Порог схожести")
+    use_reranking: Optional[bool] = Field(settings.ENABLE_RERANKING, description="Использовать реранкинг")
+    stream: Optional[bool] = Field(False, description="Потоковая передача ответа")
+
+    @validator('message')
+    def validate_message_length(cls, v):
+        if len(v.strip()) == 0:
+            raise ValueError('Сообщение не может быть пустым')
+        return v.strip()
+
+    @validator('conversation_id')
+    def validate_conversation_id(cls, v):
+        if v and len(v) > 100:
+            raise ValueError('Слишком длинный conversation_id')
+        return v
+
+
+class SearchMetrics(BaseModel):
+    found_chunks: int = Field(0, description="Найдено чанков всего")
+    used_chunks: int = Field(0, description="Использовано чанков после фильтрации")
+    avg_similarity: float = Field(0.0, description="Средняя схожесть найденных чанков")
+    search_time_ms: float = Field(0.0, description="Время поиска в миллисекундах")
+    reranking_time_ms: Optional[float] = Field(None, description="Время реранкинга в миллисекундах")
+    context_quality_score: Optional[float] = Field(None, description="Оценка качества контекста")
+
+
+class ChatResponse(BaseModel):
+    response: str = Field(..., description="Ответ ассистента")
+    conversation_id: str = Field(..., description="ID диалога")
+    sources: List[str] = Field(default_factory=list, description="Источники информации")
+    search_metrics: Optional[SearchMetrics] = Field(None, description="Метрики поиска")
+    suggested_questions: List[str] = Field(default_factory=list, description="Предлагаемые вопросы")
+    processing_time_ms: float = Field(..., description="Общее время обработки в миллисекундах")
+
+
+class ConversationHistory(BaseModel):
+    conversation_id: str
+    messages: List[Dict[str, str]]
+    created_at: datetime
+    updated_at: datetime
+    message_count: int
+
+
+def cleanup_old_conversations():
+    """Очистка старых диалогов для управления памятью"""
+    current_time = datetime.now()
+    expired_conversations = []
+    
+    for conv_id, metadata in conversation_metadata.items():
+        if current_time - metadata['updated_at'] > timedelta(seconds=settings.CONVERSATION_TTL):
+            expired_conversations.append(conv_id)
+    
+    for conv_id in expired_conversations:
+        if conv_id in conversation_store:
+            del conversation_store[conv_id]
+        if conv_id in conversation_metadata:
+            del conversation_metadata[conv_id]
+    
+    if expired_conversations:
+        logger.info(f"Очищено {len(expired_conversations)} устаревших диалогов")
+
+
+def generate_conversation_id(message: str) -> str:
+    """Генерация уникального ID диалога на основе сообщения и времени"""
+    timestamp = str(time.time())
+    unique_string = message + timestamp
+    return hashlib.md5(unique_string.encode()).hexdigest()[:16]
+
+
+def estimate_query_complexity(query: str) -> str:
+    """Оценка сложности запроса для адаптивного поиска"""
+    query_lower = query.lower()
+    query_words = len(query.split())
+    
+    # Индикаторы сложных запросов
+    complex_indicators = [
+        'как', 'почему', 'объясни', 'сравни', 'процесс', 'шаги',
+        'инструкция', 'руководство', 'настройка', 'устранение', 'ошибка'
+    ]
+    
+    # Индикаторы простых запросов
+    simple_indicators = [
+        'что', 'кто', 'где', 'когда', 'определение'
+    ]
+    
+    complex_count = sum(1 for indicator in complex_indicators if indicator in query_lower)
+    simple_count = sum(1 for indicator in simple_indicators if indicator in query_lower)
+    
+    if complex_count > 1 or query_words > 10:
+        return "high"
+    elif simple_count > 0 or query_words <= 3:
+        return "low"
+    else:
+        return "medium"
+
+
+def calculate_adaptive_top_k(complexity: str, available_docs: int, user_top_k: int) -> int:
+    """Адаптивное определение количества используемых чанков"""
+    base_k = {
+        "low": min(2, available_docs),
+        "medium": min(4, available_docs),
+        "high": min(6, available_docs)
+    }[complexity]
+    
+    # Учитываем настройку пользователя, но не превышаем доступное количество
+    return min(user_top_k, available_docs, base_k)
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """
+    Основной endpoint для чата с RAG системой
+    """
+    start_time = time.time()
+    
+    try:
+        # Очистка старых диалогов (выполняется периодически)
+        if len(conversation_store) > 100:  # Если много диалогов в памяти
+            cleanup_old_conversations()
         
-        // Используйте innerHTML вместо textContent для поддержки HTML-разметки
-        messageDiv.innerHTML = `<strong>${roleNames[role]}:</strong> ${content}`;
+        # Создаем или получаем ID диалога
+        conversation_id = request.conversation_id or generate_conversation_id(request.message)
+        
+        # Получаем историю диалога
+        history = conversation_store.get(conversation_id, [])
+        
+        # Обновляем метаданные диалога
+        current_time = datetime.now()
+        if conversation_id not in conversation_metadata:
+            conversation_metadata[conversation_id] = {
+                'created_at': current_time,
+                'updated_at': current_time,
+                'message_count': 0
+            }
+        conversation_metadata[conversation_id]['updated_at'] = current_time
+        conversation_metadata[conversation_id]['message_count'] += 1
+        
+        # Поиск релевантных документов
+        search_start = time.time()
+        search_results = vector_store.search_enhanced(
+            request.message, 
+            top_k=request.top_k,
+            similarity_threshold=request.similarity_threshold
+        )
+        search_time = (time.time() - search_start) * 1000
+        
+        # Подготовка метрик поиска
+        search_metrics = SearchMetrics(
+            found_chunks=len(search_results),
+            search_time_ms=search_time
+        )
+        
+        context_docs = []
+        reranking_time = None
+        
+        if search_results:
+            # Извлекаем тексты документов и их схожести
+            documents = [result["document"] for result in search_results]
+            similarities = [result["similarity"] for result in search_results]
+            
+            search_metrics.avg_similarity = sum(similarities) / len(similarities) if similarities else 0
+            
+            # Адаптивный выбор количества чанков
+            query_complexity = estimate_query_complexity(request.message)
+            adaptive_top_k = calculate_adaptive_top_k(
+                query_complexity, 
+                len(documents), 
+                request.top_k or settings.DEFAULT_TOP_K
+            )
+            
+            # Реранкинг если включен и есть достаточно документов
+            if request.use_reranking and len(documents) > 1 and settings.ENABLE_RERANKING:
+                rerank_start = time.time()
+                reranked_docs = reranker_service.rerank(
+                    request.message, 
+                    documents, 
+                    top_k=min(adaptive_top_k * 2, len(documents))
+                )
+                reranking_time = (time.time() - rerank_start) * 1000
+                
+                # Берем топ документы после реранкинга
+                context_docs = [doc for doc, score in reranked_docs[:adaptive_top_k]]
+                search_metrics.reranking_time_ms = reranking_time
+            else:
+                # Берем топ документы по схожести
+                context_docs = documents[:adaptive_top_k]
+            
+            search_metrics.used_chunks = len(context_docs)
+            
+            # Оценка качества контекста
+            if similarities:
+                avg_used_similarity = sum(similarities[:len(context_docs)]) / len(context_docs)
+                search_metrics.context_quality_score = min(avg_used_similarity * 1.5, 1.0)
+        
+        # Генерация ответа с контекстом
+        generation_start = time.time()
+        
+        # Подготавливаем метрики для LLM
+        llm_search_metrics = None
+        if settings.ENABLE_METRICS_LOGGING:
+            llm_search_metrics = {
+                "found_chunks": search_metrics.found_chunks,
+                "used_chunks": search_metrics.used_chunks,
+                "avg_similarity": search_metrics.avg_similarity
+            }
+        
+        response = llm_service.generate_with_context(
+            question=request.message,
+            context=context_docs,
+            conversation_history=history,
+            search_metrics=llm_search_metrics
+        )
+        generation_time = (time.time() - generation_start) * 1000
+        
+        # Подготовка источников для ответа
+        sources = []
+        if search_results:
+            # Берем метаданные первых результатов
+            for result in search_results[:3]:
+                source_info = result.get("metadata", {}).get("source", "Документ")
+                sources.append(f"{source_info} (схожесть: {result['similarity']:.2f})")
+        
+        # Генерация предлагаемых вопросов
+        suggested_questions = generate_suggested_questions(request.message, context_docs)
+        
+        # Обновляем историю диалога
+        history.extend([
+            {"role": "user", "content": request.message},
+            {"role": "assistant", "content": response},
+        ])
+        
+        # Ограничение истории
+        conversation_store[conversation_id] = history[-settings.MAX_CONVERSATION_HISTORY:]
+        
+        total_time = (time.time() - start_time) * 1000
+        
+        # Логирование метрик
+        if settings.ENABLE_METRICS_LOGGING:
+            logger.info(
+                f"Chat completed: conversation_id={conversation_id}, "
+                f"query_complexity={query_complexity}, "
+                f"found_chunks={search_metrics.found_chunks}, "
+                f"used_chunks={search_metrics.used_chunks}, "
+                f"avg_similarity={search_metrics.avg_similarity:.2f}, "
+                f"total_time={total_time:.0f}ms"
+            )
+        
+        return ChatResponse(
+            response=response,
+            conversation_id=conversation_id,
+            sources=sources,
+            search_metrics=search_metrics,
+            suggested_questions=suggested_questions,
+            processing_time_ms=total_time
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка в чат эндпоинте: {e}")
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера: {str(e)}")
+
+
+def generate_suggested_questions(current_question: str, context_docs: List[str]) -> List[str]:
+    """Генерация предлагаемых вопросов на основе текущего запроса и контекста"""
+    suggestions = []
+    
+    current_lower = current_question.lower()
+    
+    # Базовые предложения на основе типа вопроса
+    if any(word in current_lower for word in ['как', 'инструкция', 'настройка']):
+        suggestions.extend([
+            "Какие есть альтернативные способы?",
+            "Что делать если это не работает?",
+            "Какие требования для этого?"
+        ])
+    elif any(word in current_lower for word in ['ошибка', 'проблема', 'не работает']):
+        suggestions.extend([
+            "Как предотвратить эту ошибку?",
+            "Какие есть коды ошибок?",
+            "Куда обращаться за помощью?"
+        ])
+    else:
+        suggestions.extend([
+            "Можете рассказать подробнее?",
+            "Какие есть связанные темы?",
+            "Где найти дополнительную информацию?"
+        ])
+    
+    # Ограничиваем количество предложений
+    return suggestions[:3]
+
+
+@router.get("/conversations/{conversation_id}", response_model=ConversationHistory)
+async def get_conversation(conversation_id: str):
+    """Получить историю диалога"""
+    if conversation_id not in conversation_store:
+        raise HTTPException(status_code=404, detail="Диалог не найден")
+    
+    history = conversation_store[conversation_id]
+    metadata = conversation_metadata.get(conversation_id, {})
+    
+    return ConversationHistory(
+        conversation_id=conversation_id,
+        messages=history,
+        created_at=metadata.get('created_at', datetime.now()),
+        updated_at=metadata.get('updated_at', datetime.now()),
+        message_count=metadata.get('message_count', 0)
+    )
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Удалить диалог"""
+    if conversation_id in conversation_store:
+        del conversation_store[conversation_id]
+    if conversation_id in conversation_metadata:
+        del conversation_metadata[conversation_id]
+    
+    return {"message": "Диалог удален"}
+
+
+@router.get("/conversations")
+async def list_conversations(limit: int = 10, offset: int = 0):
+    """Список последних диалогов"""
+    cleanup_old_conversations()  # Очищаем перед показом
+    
+    conversations = []
+    for conv_id in list(conversation_metadata.keys())[offset:offset + limit]:
+        metadata = conversation_metadata[conv_id]
+        history_length = len(conversation_store.get(conv_id, []))
+        
+        conversations.append({
+            "conversation_id": conv_id,
+            "created_at": metadata['created_at'],
+            "updated_at": metadata['updated_at'],
+            "message_count": metadata['message_count'],
+            "history_length": history_length
+        })
+    
+    return {
+        "conversations": conversations,
+        "total": len(conversation_metadata),
+        "limit": limit,
+        "offset": offset
     }
-    // ... остальной код ...
-}
+
+# rag_vllm_app/app/services/vector_store.py
+import chromadb
+from chromadb.config import Settings
+from typing import List, Dict, Any, Optional
+import uuid
+import time
+from loguru import logger
+
+from app.config import settings
+
+
+class VectorStoreService:
+    """Сервис для работы с векторным хранилищем ChromaDB"""
+    
+    def __init__(self):
+        self.client = None
+        self.collection = None
+        self.initialized = False
+        self.initialize()
+    
+    def initialize(self):
+        """Инициализация подключения к ChromaDB"""
+        try:
+            # Создаем персистентного клиента ChromaDB
+            self.client = chromadb.PersistentClient(
+                path=settings.CHROMA_PATH,
+                settings=Settings(anonymized_telemetry=False)
+            )
+            
+            # Получаем или создаем коллекцию
+            self.collection = self.client.get_or_create_collection(
+                name=settings.COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"}  # Используем косинусное расстояние
+            )
+            
+            self.initialized = True
+            logger.success(f"ChromaDB инициализирована. Коллекция: {settings.COLLECTION_NAME}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка инициализации ChromaDB: {e}")
+            self.initialized = False
+            raise
+    
+    def heartbeat(self):
+        """Проверка работоспособности ChromaDB"""
+        if not self.initialized:
+            return False
+        
+        try:
+            # Простая проверка через получение количества элементов
+            count = self.collection.count()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка heartbeat ChromaDB: {e}")
+            self.initialized = False
+            return False
+    
+    def add_documents(self, documents: List[str], metadatas: Optional[List[Dict]] = None, 
+                     ids: Optional[List[str]] = None) -> bool:
+        """
+        Добавление документов в векторное хранилище
+        
+        Args:
+            documents: Список текстов документов
+            metadatas: Список метаданных для каждого документа
+            ids: Список ID для каждого документа
+            
+        Returns:
+            bool: Успешность операции
+        """
+        if not self.initialized:
+            logger.error("ChromaDB не инициализирована")
+            return False
+        
+        try:
+            # Генерация ID если не предоставлены
+            if ids is None:
+                ids = [str(uuid.uuid4()) for _ in documents]
+            
+            # Подготовка метаданных если не предоставлены
+            if metadatas is None:
+                metadatas = [{} for _ in documents]
+            
+            # Добавление временных меток в метаданные
+            current_time = int(time.time())
+            for metadata in metadatas:
+                metadata["created_at"] = current_time
+                if "source" not in metadata:
+                    metadata["source"] = "uploaded_document"
+            
+            # Добавление документов в коллекцию
+            self.collection.add(
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids
+            )
+            
+            logger.info(f"Успешно добавлено {len(documents)} документов в ChromaDB")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка добавления документов в ChromaDB: {e}")
+            return False
+    
+    def search(self, query: str, top_k: int = None, 
+               similarity_threshold: float = None) -> List[Dict[str, Any]]:
+        """
+        Базовая семантическая поиск по запросу
+        
+        Args:
+            query: Поисковый запрос
+            top_k: Количество возвращаемых результатов
+            similarity_threshold: Порог схожести (0-1)
+            
+        Returns:
+            List[Dict]: Список результатов поиска
+        """
+        if not self.initialized:
+            logger.error("ChromaDB не инициализирована")
+            return []
+        
+        top_k = top_k or settings.DEFAULT_TOP_K
+        similarity_threshold = similarity_threshold or settings.DEFAULT_SIMILARITY_THRESHOLD
+        
+        try:
+            # Выполняем поиск в ChromaDB
+            results = self.collection.query(
+                query_texts=[query],
+                n_results=top_k * 2,  # Получаем больше для последующей фильтрации
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            if not results["documents"] or not results["documents"][0]:
+                return []
+            
+            # Преобразуем расстояния в схожести и фильтруем
+            search_results = []
+            for i, document in enumerate(results["documents"][0]):
+                # Конвертируем расстояние в схожесть (1 - расстояние)
+                similarity = 1 - results["distances"][0][i]
+                
+                if similarity >= similarity_threshold:
+                    search_results.append({
+                        "document": document,
+                        "metadata": results["metadatas"][0][i],
+                        "similarity": similarity,
+                        "distance": results["distances"][0][i]
+                    })
+            
+            # Сортируем по схожести и обрезаем до top_k
+            search_results.sort(key=lambda x: x["similarity"], reverse=True)
+            return search_results[:top_k]
+            
+        except Exception as e:
+            logger.error(f"Ошибка поиска в ChromaDB: {e}")
+            return []
+    
+    def search_enhanced(self, query: str, top_k: int = None, 
+                       similarity_threshold: float = None,
+                       metadata_filter: Optional[Dict] = None) -> List[Dict[str, Any]]:
+        """
+        Расширенный поиск с фильтрацией и метриками
+        
+        Args:
+            query: Поисковый запрос
+            top_k: Количество возвращаемых результатов
+            similarity_threshold: Порог схожести
+            metadata_filter: Фильтр по метаданным
+            
+        Returns:
+            List[Dict]: Список результатов поиска с метриками
+        """
+        if not self.initialized:
+            logger.error("ChromaDB не инициализирована")
+            return []
+        
+        top_k = top_k or settings.DEFAULT_TOP_K
+        similarity_threshold = similarity_threshold or settings.DEFAULT_SIMILARITY_THRESHOLD
+        
+        try:
+            # Подготавливаем параметры запроса
+            query_params = {
+                "query_texts": [query],
+                "n_results": min(top_k * 3, 50),  # Получаем больше для фильтрации
+                "include": ["documents", "metadatas", "distances"]
+            }
+            
+            # Добавляем фильтр по метаданным если указан
+            if metadata_filter:
+                query_params["where"] = metadata_filter
+            
+            # Выполняем поиск
+            results = self.collection.query(**query_params)
+            
+            if not results["documents"] or not results["documents"][0]:
+                return []
+            
+            # Обрабатываем и фильтруем результаты
+            search_results = []
+            for i, document in enumerate(results["documents"][0]):
+                similarity = 1 - results["distances"][0][i]
+                
+                # Применяем порог схожести
+                if similarity >= similarity_threshold:
+                    search_results.append({
+                        "document": document,
+                        "metadata": results["metadatas"][0][i],
+                        "similarity": similarity,
+                        "distance": results["distances"][0][i],
+                        "id": results["ids"][0][i] if results["ids"] else None
+                    })
+            
+            # Дополнительная сортировка по дате если есть в метаданных
+            try:
+                search_results.sort(
+                    key=lambda x: (
+                        x["similarity"], 
+                        x["metadata"].get("created_at", 0)
+                    ), 
+                    reverse=True
+                )
+            except:
+                # Если сортировка по дате не удалась, сортируем только по схожести
+                search_results.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            return search_results[:top_k]
+            
+        except Exception as e:
+            logger.error(f"Ошибка расширенного поиска в ChromaDB: {e}")
+            return []
+    
+    def hybrid_search(self, query: str, top_k: int = None,
+                     keyword_weight: float = 0.3, 
+                     semantic_weight: float = 0.7) -> List[Dict[str, Any]]:
+        """
+        Гибридный поиск (семантический + ключевые слова)
+        
+        Args:
+            query: Поисковый запрос
+            top_k: Количество результатов
+            keyword_weight: Вес ключевых слов
+            semantic_weight: Вес семантического поиска
+            
+        Returns:
+            List[Dict]: Результаты гибридного поиска
+        """
+        # В текущей реализации используем только семантический поиск
+        # В будущем можно добавить полнотекстовый поиск
+        return self.search_enhanced(query, top_k)
+    
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """Получение статистики коллекции"""
+        if not self.initialized:
+            return {"error": "ChromaDB не инициализирована"}
+        
+        try:
+            count = self.collection.count()
+            
+            # Получаем несколько документов для анализа
+            sample_results = self.collection.peek(limit=min(100, count))
+            
+            # Анализируем среднюю длину документов
+            avg_doc_length = 0
+            if sample_results["documents"]:
+                doc_lengths = [len(doc) for doc in sample_results["documents"]]
+                avg_doc_length = sum(doc_lengths) / len(doc_lengths)
+            
+            return {
+                "collection_name": settings.COLLECTION_NAME,
+                "total_documents": count,
+                "average_document_length": round(avg_doc_length, 2),
+                "chroma_path": settings.CHROMA_PATH,
+                "vector_dimension": settings.VECTOR_DIMENSION
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики коллекции: {e}")
+            return {"error": str(e)}
+    
+    def delete_documents(self, ids: List[str]) -> bool:
+        """Удаление документов по ID"""
+        if not self.initialized:
+            return False
+        
+        try:
+            self.collection.delete(ids=ids)
+            logger.info(f"Удалено {len(ids)} документов из ChromaDB")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка удаления документов: {e}")
+            return False
+    
+    def update_document(self, document_id: str, new_document: str, 
+                       new_metadata: Optional[Dict] = None) -> bool:
+        """Обновление документа"""
+        if not self.initialized:
+            return False
+        
+        try:
+            # Обновляем метаданные
+            if new_metadata:
+                new_metadata["updated_at"] = int(time.time())
+            
+            self.collection.update(
+                ids=[document_id],
+                documents=[new_document],
+                metadatas=[new_metadata] if new_metadata else None
+            )
+            
+            logger.info(f"Документ {document_id} обновлен")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка обновления документа: {e}")
+            return False
+    
+    def search_by_metadata(self, metadata_filter: Dict, limit: int = 100) -> List[Dict[str, Any]]:
+        """Поиск документов по метаданным"""
+        if not self.initialized:
+            return []
+        
+        try:
+            results = self.collection.get(
+                where=metadata_filter,
+                limit=limit,
+                include=["documents", "metadatas"]
+            )
+            
+            search_results = []
+            for i, document in enumerate(results["documents"]):
+                search_results.append({
+                    "document": document,
+                    "metadata": results["metadatas"][i],
+                    "id": results["ids"][i]
+                })
+            
+            return search_results
+            
+        except Exception as e:
+            logger.error(f"Ошибка поиска по метаданным: {e}")
+            return []
+
+
+# Глобальный экземпляр сервиса
+vector_store = VectorStoreService()
+
+
+def get_chroma_client():
+    """Функция для dependency injection"""
+    return vector_store.client
