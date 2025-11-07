@@ -1,0 +1,123 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from app.services.llm_service import llm_service
+from app.services.vector_store import vector_store
+from app.config import settings
+from loguru import logger
+
+router = APIRouter()
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str = Field(default="")
+    conversation_id: str = Field(default="default")
+    sources: List[str] = Field(default_factory=list)
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    try:
+        logger.info(f"Получен запрос чата: {request.message}")
+        
+        # Получаем релевантные документы
+        search_results = vector_store.search(request.message)
+        logger.info(f"Найдено документов: {len(search_results)}")
+        
+        # Извлекаем тексты документов
+        documents = []
+        if search_results:
+            documents = [result['document'] for result in search_results]
+            logger.info(f"Первый документ: {documents[0][:100]}..." if documents else "Нет документов")
+        
+        # Генерируем ответ
+        response_text = ""
+        try:
+            response_text = llm_service.generate_with_context(
+                question=request.message,
+                context=documents
+            )
+            
+            # Проверяем, что ответ не пустой
+            if not response_text or response_text.strip() == "":
+                response_text = "Не удалось получить ответ от модели. Пожалуйста, попробуйте еще раз."
+                
+        except Exception as e:
+            logger.error(f"Ошибка генерации ответа: {e}")
+            response_text = f"Ошибка при обращении к AI модели: {str(e)}"
+        
+        # Формируем источники
+        sources = []
+        if documents:
+            sources = [doc[:100] + "..." for doc in documents[:3]]
+        
+        # Создаем ответ
+        chat_response = ChatResponse(
+            response=response_text,
+            conversation_id=request.conversation_id or "default",
+            sources=sources
+        )
+        
+        logger.info(f"Отправлен ответ длиной {len(response_text)} символов")
+        return chat_response
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка в chat_endpoint: {e}")
+        # Возвращаем ответ с ошибкой, но в правильном формате
+        return ChatResponse(
+            response=f"Произошла внутренняя ошибка: {str(e)}",
+            conversation_id=request.conversation_id or "default",
+            sources=[]
+        )
+
+def generate_with_context(self, question: str, context: List[str], conversation_history: Optional[List[Dict]] = None) -> str:
+    """Генерация ответа с контекстом RAG с гарантированным возвратом строки"""
+    try:
+        system_prompt = """Ты - AI ассистент технической поддержки. Отвечай на вопросы пользователя на основе предоставленного контекста.
+Если в контексте нет информации для ответа, вежливо сообщи об этом."""
+
+        context_text = "\n".join([f"[Документ {i+1}]: {doc}" for i, doc in enumerate(context)]) if context else "Контекст не предоставлен"
+        
+        user_prompt = f"""Контекст для ответа:
+{context_text}
+
+Вопрос: {question}
+
+Ответь максимально полезно и точно на основе контекста выше:"""
+
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        if conversation_history:
+            messages.extend(conversation_history)
+        
+        messages.append({"role": "user", "content": user_prompt})
+        
+        logger.info(f"Отправка запроса к LMStudio с {len(messages)} сообщениями")
+        
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=1024,
+            stream=False
+        )
+        
+        # Безопасное извлечение контента
+        if (hasattr(response, 'choices') and 
+            len(response.choices) > 0 and 
+            hasattr(response.choices[0], 'message') and 
+            hasattr(response.choices[0].message, 'content')):
+            
+            result = response.choices[0].message.content.strip()
+            logger.info(f"Успешно получен ответ от LMStudio: {result[:100]}...")
+            return result if result else "Не удалось получить ответ от модели."
+        else:
+            logger.warning(f"Неожиданная структура ответа от LMStudio: {response}")
+            return "Не удалось обработать ответ от модели."
+        
+    except Exception as e:
+        logger.error(f"Исключение в generate_with_context: {e}")
+        return f"Извините, произошла ошибка при обработке запроса: {str(e)}"
+
