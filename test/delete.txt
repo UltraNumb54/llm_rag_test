@@ -1,2 +1,0 @@
-cd ~/zed_projects/llm_rag/rag_vllm_app
-python start_server.py
