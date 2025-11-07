@@ -1,123 +1,269 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+chat.py:
 from typing import List, Optional
-from app.services.llm_service import llm_service
-from app.services.vector_store import vector_store
 from app.config import settings
+from app.services.llm_service import llm_service
+from app.services.reranker import reranker_service
+from app.services.vector_store import vector_store
+from fastapi import APIRouter, HTTPException
 from loguru import logger
+from pydantic import BaseModel, Field
 
 router = APIRouter()
+
+# Временное хранилище для истории диалогов (в продакшене заменить на Redis/БД)
+conversation_store = {}
 
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
+    use_reranking: bool = True
 
 class ChatResponse(BaseModel):
     response: str = Field(default="")
     conversation_id: str = Field(default="default")
     sources: List[str] = Field(default_factory=list)
+    suggested_questions: List[str] = Field(default_factory=list)
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     try:
         logger.info(f"Получен запрос чата: {request.message}")
         
-        # Получаем релевантные документы
-        search_results = vector_store.search(request.message)
+        # Создаем или получаем ID диалога
+        conversation_id = request.conversation_id or f"conv_{len(conversation_store) + 1}"
+        
+        # Получаем историю диалога
+        history = conversation_store.get(conversation_id, [])
+        
+        # Ищем релевантные документы
+        search_results = vector_store.search(request.message, top_k=settings.TOP_K)
         logger.info(f"Найдено документов: {len(search_results)}")
         
-        # Извлекаем тексты документов
-        documents = []
-        if search_results:
-            documents = [result['document'] for result in search_results]
-            logger.info(f"Первый документ: {documents[0][:100]}..." if documents else "Нет документов")
-        
-        # Генерируем ответ
         response_text = ""
-        try:
+        sources = []
+        
+        if not search_results:
+            response_text = "Извините, в моей базе знаний нет информации для ответа на этот вопрос."
+            logger.info("Документы не найдены, используем стандартный ответ")
+        else:
+            # Извлекаем тексты документов
+            documents = [result["document"] for result in search_results]
+            logger.info(f"Первый документ: {documents[0][:100]}..." if documents else "Нет документов")
+            
+            # Реранкинг если включен
+            if request.use_reranking and len(documents) > 1:
+                logger.info("Применяем реранкинг документов")
+                reranked_docs = reranker_service.rerank(
+                    request.message, documents, top_k=settings.RERANK_TOP_K
+                )
+                context_docs = [doc for doc, score in reranked_docs]
+            else:
+                context_docs = documents[:settings.RERANK_TOP_K]
+            
+            # Генерация ответа с контекстом
+            logger.info("Генерация ответа с контекстом...")
             response_text = llm_service.generate_with_context(
                 question=request.message,
-                context=documents
+                context=context_docs,
+                conversation_history=history
             )
             
-            # Проверяем, что ответ не пустой
+            # Проверяем что ответ не пустой
             if not response_text or response_text.strip() == "":
                 response_text = "Не удалось получить ответ от модели. Пожалуйста, попробуйте еще раз."
-                
-        except Exception as e:
-            logger.error(f"Ошибка генерации ответа: {e}")
-            response_text = f"Ошибка при обращении к AI модели: {str(e)}"
+                logger.warning("Получен пустой ответ от модели")
+            
+            sources = [result["document"][:100] + "..." for result in search_results[:3]]
         
-        # Формируем источники
-        sources = []
-        if documents:
-            sources = [doc[:100] + "..." for doc in documents[:3]]
+        # Обновляем историю диалога
+        history.extend([
+            {"role": "user", "content": request.message},
+            {"role": "assistant", "content": response_text}
+        ])
         
-        # Создаем ответ
-        chat_response = ChatResponse(
+        # Ограничиваем историю последними 10 сообщениями
+        conversation_store[conversation_id] = history[-10:]
+        
+        # Предлагаемые вопросы
+        suggested_questions = [
+            "Какие документы можно загружать?",
+            "Как работает поиск?",
+            "Какие форматы файлов поддерживаются?"
+        ]
+        
+        logger.info(f"Успешно сгенерирован ответ длиной {len(response_text)} символов")
+        
+        return ChatResponse(
             response=response_text,
-            conversation_id=request.conversation_id or "default",
-            sources=sources
+            conversation_id=conversation_id,
+            sources=sources,
+            suggested_questions=suggested_questions
         )
-        
-        logger.info(f"Отправлен ответ длиной {len(response_text)} символов")
-        return chat_response
         
     except Exception as e:
-        logger.error(f"Критическая ошибка в chat_endpoint: {e}")
+        logger.error(f"Ошибка в чате: {e}")
         # Возвращаем ответ с ошибкой, но в правильном формате
         return ChatResponse(
-            response=f"Произошла внутренняя ошибка: {str(e)}",
-            conversation_id=request.conversation_id or "default",
-            sources=[]
+            response=f"Произошла ошибка при обработке запроса: {str(e)}",
+            conversation_id=request.conversation_id or "error",
+            sources=[],
+            suggested_questions=[]
         )
 
-def generate_with_context(self, question: str, context: List[str], conversation_history: Optional[List[Dict]] = None) -> str:
-    """Генерация ответа с контекстом RAG с гарантированным возвратом строки"""
-    try:
-        system_prompt = """Ты - AI ассистент технической поддержки. Отвечай на вопросы пользователя на основе предоставленного контекста.
-Если в контексте нет информации для ответа, вежливо сообщи об этом."""
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """Получить историю диалога"""
+    history = conversation_store.get(conversation_id, [])
+    return {"conversation_id": conversation_id, "history": history}
 
-        context_text = "\n".join([f"[Документ {i+1}]: {doc}" for i, doc in enumerate(context)]) if context else "Контекст не предоставлен"
+
+llm_servcie.py
+import time
+from typing import Dict, List, Optional
+from app.config import settings
+from loguru import logger
+from openai import OpenAI
+
+class LMStudioService:
+    def __init__(self):
+        self.client = OpenAI(
+            base_url=settings.LMSTUDIO_BASE_URL,
+            api_key=settings.LMSTUDIO_API_KEY
+        )
+        self.model_name = settings.LMSTUDIO_MODEL_NAME
+        self.test_connection()
+
+    def test_connection(self):
+        """Тестирование подключения к LMStudio"""
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                # Проверяем доступность моделей
+                models = self.client.models.list()
+                model_names = [model.id for model in models.data]
+                logger.info(f"Доступные модели в LMStudio: {model_names}")
+
+                # Если модель не найдена, используем первую доступную
+                if self.model_name != "local-model" and self.model_name not in model_names:
+                    available_model = model_names[0] if model_names else "local-model"
+                    logger.warning(f"Модель {self.model_name} не найдена. Используем: {available_model}")
+                    self.model_name = available_model
+
+                # Тестовый запрос
+                test_response = self.generate("Ответь 'OK'", max_tokens=5)
+                logger.success(f"LMStudio подключен успешно. Тестовый ответ: {test_response}")
+                return
+                
+            except Exception as e:
+                logger.warning(f"Попытка {attempt + 1}/{max_retries}: Ошибка подключения к LMStudio: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                else:
+                    logger.error("Не удалось подключиться к LMStudio после нескольких попыток")
+                    logger.info("Убедитесь, что LMStudio запущен и сервер доступен по адресу: " + settings.LMSTUDIO_BASE_URL)
+                    raise
+
+    def generate(self, 
+                prompt: str, 
+                temperature: float = 0.1, 
+                max_tokens: int = 2048, 
+                system_message: Optional[str] = None) -> str:
+        """Генерация ответа через LMStudio"""
+        messages = []
         
-        user_prompt = f"""Контекст для ответа:
+        if system_message:
+            messages.append({"role": "system", "content": system_message})
+        
+        messages.append({"role": "user", "content": prompt})
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False
+            )
+            
+            # Безопасное извлечение контента
+            if (hasattr(response, 'choices') and 
+                len(response.choices) > 0 and 
+                hasattr(response.choices[0], 'message') and 
+                hasattr(response.choices[0].message, 'content')):
+                
+                result = response.choices[0].message.content.strip()
+                return result if result else "Пустой ответ от модели"
+            else:
+                logger.warning(f"Неожиданная структура ответа: {response}")
+                return "Не удалось обработать ответ от модели"
+                
+        except Exception as e:
+            logger.error(f"Ошибка генерации через LMStudio: {e}")
+            return f"Ошибка при обращении к модели: {str(e)}"
+
+    def generate_with_context(self, 
+                            question: str, 
+                            context: List[str], 
+                            conversation_history: Optional[List[Dict]] = None) -> str:
+        """Генерация ответа с контекстом RAG"""
+        
+        system_prompt = """Ты - полезный AI ассистент. Отвечай на вопросы пользователя на основе предоставленного контекста.
+Если в контексте нет информации для ответа, просто скажи что не знаешь."""
+
+        # Формируем контекст
+        if context and len(context) > 0:
+            context_text = "\n".join([f"- {doc}" for doc in context[:3]])
+            user_prompt = f"""На основе следующей информации ответь на вопрос:
+
+Информация:
 {context_text}
 
 Вопрос: {question}
 
-Ответь максимально полезно и точно на основе контекста выше:"""
-
-        messages = [{"role": "system", "content": system_prompt}]
+Ответ:"""
+        else:
+            # Если контекста нет, отвечаем без него
+            user_prompt = f"Вопрос: {question}\n\nОтвет:"
         
+        messages = []
+        
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        
+        # Добавляем историю диалога если есть
         if conversation_history:
             messages.extend(conversation_history)
         
         messages.append({"role": "user", "content": user_prompt})
         
-        logger.info(f"Отправка запроса к LMStudio с {len(messages)} сообщениями")
-        
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=1024,
-            stream=False
-        )
-        
-        # Безопасное извлечение контента
-        if (hasattr(response, 'choices') and 
-            len(response.choices) > 0 and 
-            hasattr(response.choices[0], 'message') and 
-            hasattr(response.choices[0].message, 'content')):
+        try:
+            logger.info(f"Отправка запроса к LMStudio с {len(messages)} сообщениями")
+            logger.info(f"Контекст: {context[:1] if context else 'нет'}")
             
-            result = response.choices[0].message.content.strip()
-            logger.info(f"Успешно получен ответ от LMStudio: {result[:100]}...")
-            return result if result else "Не удалось получить ответ от модели."
-        else:
-            logger.warning(f"Неожиданная структура ответа от LMStudio: {response}")
-            return "Не удалось обработать ответ от модели."
-        
-    except Exception as e:
-        logger.error(f"Исключение в generate_with_context: {e}")
-        return f"Извините, произошла ошибка при обработке запроса: {str(e)}"
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=512,
+                stream=False
+            )
+            
+            # Безопасное извлечение контента
+            if (hasattr(response, 'choices') and 
+                len(response.choices) > 0 and 
+                hasattr(response.choices[0], 'message') and 
+                hasattr(response.choices[0].message, 'content')):
+                
+                result = response.choices[0].message.content.strip()
+                logger.info(f"Получен ответ от LMStudio: {result[:100]}...")
+                return result if result else "Не удалось получить ответ от модели."
+            else:
+                logger.warning(f"Неожиданная структура ответа от LMStudio: {response}")
+                return "Не удалось обработать ответ от модели."
+            
+        except Exception as e:
+            logger.error(f"Ошибка при запросе к LMStudio: {e}")
+            return f"Извините, произошла ошибка при обращении к AI модели: {str(e)}"
 
+# Глобальный экземпляр сервиса
+llm_service = LMStudioService()
