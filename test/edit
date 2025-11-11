@@ -1,3 +1,75 @@
+embed
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from app.config import settings
+from loguru import logger
+
+class EmbeddingService:
+    def __init__(self):
+        self.model_name = settings.EMBEDDING_MODEL
+        self.model = None
+        self.embedding_dim = 384  # Ожидаемая размерность для multilingual-MiniLM-L12-v2
+        self._load_model()
+
+    def _load_model(self):
+        """Загрузка модели эмбеддингов"""
+        try:
+            logger.info(f"Загрузка модели эмбеддингов: {self.model_name}")
+            self.model = SentenceTransformer(self.model_name)
+            
+            # Проверяем реальную размерность модели
+            test_embedding = self.model.encode(["тестовый текст"])
+            actual_dim = len(test_embedding[0]) if hasattr(test_embedding[0], '__len__') else 1
+            
+            logger.info(f"Модель загружена. Размерность эмбеддингов: {actual_dim}")
+            
+            if actual_dim != self.embedding_dim:
+                logger.warning(f"Фактическая размерность ({actual_dim}) не совпадает с ожидаемой ({self.embedding_dim})")
+                self.embedding_dim = actual_dim
+                
+        except Exception as e:
+            logger.error(f"Ошибка загрузки модели эмбеддингов: {e}")
+            raise
+
+    def encode(self, texts):
+        """Создание эмбеддингов для текстов"""
+        if not texts:
+            return []
+            
+        try:
+            # Если передан один текст, преобразуем в список
+            if isinstance(texts, str):
+                texts = [texts]
+                
+            embeddings = self.model.encode(texts)
+            
+            # Преобразуем в numpy array если нужно
+            if not isinstance(embeddings, np.ndarray):
+                embeddings = np.array(embeddings)
+                
+            # Логируем информацию о эмбеддингах для отладки
+            if len(embeddings) > 0:
+                first_embedding = embeddings[0]
+                logger.debug(f"Создан эмбеддинг: форма={embeddings.shape}, тип={type(embeddings)}, первый элемент тип={type(first_embedding)}")
+                
+                if hasattr(first_embedding, '__len__'):
+                    logger.debug(f"Размерность первого эмбеддинга: {len(first_embedding)}")
+                    logger.debug(f"Пример значений: {first_embedding[:5]}")
+                else:
+                    logger.warning(f"Эмбеддинг не является вектором: {first_embedding}")
+                    
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания эмбеддингов: {e}")
+            raise
+
+# Глобальный экземпляр сервиса
+embedding_service = EmbeddingService()
+
+vector
+
 import uuid
 import json
 import math
@@ -11,7 +83,8 @@ from loguru import logger
 
 class PGVectorStoreService:
     def __init__(self):
-        self.embedding_dim = 384  # Размерность для multilingual-MiniLM-L12-v2
+        # Получаем актуальную размерность из сервиса эмбеддингов
+        self.embedding_dim = embedding_service.embedding_dim
         self.pool = None
         self.initialized = False
 
@@ -22,7 +95,7 @@ class PGVectorStoreService:
                 logger.info("Инициализация пула соединений с базой данных...")
                 self.pool = await get_database_pool()
                 self.initialized = True
-                logger.info("Vector store service initialized successfully")
+                logger.info(f"Vector store service initialized with embedding dim: {self.embedding_dim}")
             else:
                 self.pool = await get_database_pool()
                 self.initialized = True
@@ -38,14 +111,31 @@ class PGVectorStoreService:
 
     def _validate_and_clean_embedding(self, embedding) -> List[float]:
         """Валидация и очистка эмбеддинга"""
+        # Если эмбеддинг - это numpy array, преобразуем в список
         if hasattr(embedding, 'tolist'):
             embedding_list = embedding.tolist()
         else:
             embedding_list = embedding
 
+        # Если embedding_list - это один число, создаем список
+        if isinstance(embedding_list, (int, float)):
+            embedding_list = [float(embedding_list)]
+
         # Проверяем длину вектора
         if len(embedding_list) != self.embedding_dim:
             logger.warning(f"Размерность эмбеддинга ({len(embedding_list)}) не совпадает с ожидаемой ({self.embedding_dim})")
+            # Если размерность не совпадает, используем первую размерность или заполняем нулями
+            if len(embedding_list) == 1:
+                # Дублируем значение для достижения нужной размерности
+                embedding_list = [embedding_list[0]] * self.embedding_dim
+                logger.info(f"Эмбеддинг расширен до размерности {self.embedding_dim}")
+            else:
+                # Обрезаем или дополняем нулями до нужной размерности
+                if len(embedding_list) > self.embedding_dim:
+                    embedding_list = embedding_list[:self.embedding_dim]
+                else:
+                    embedding_list.extend([0.0] * (self.embedding_dim - len(embedding_list)))
+                logger.info(f"Эмбеддинг приведен к размерности {self.embedding_dim}")
 
         # Проверяем на наличие nan и inf, заменяем на 0
         cleaned_embedding = []
@@ -59,6 +149,15 @@ class PGVectorStoreService:
                 cleaned_embedding.append(0.0)
 
         return cleaned_embedding
+
+    def _embedding_to_pgvector(self, embedding) -> str:
+        """Преобразование эмбеддинга в строку для PostgreSQL vector"""
+        cleaned_embedding = self._validate_and_clean_embedding(embedding)
+        
+        # Форматируем каждое число с 6 знаками после запятой
+        # PostgreSQL vector ожидает формат: [1.0, 2.0, 3.0]
+        vector_str = '[' + ','.join([f"{x:.6f}" for x in cleaned_embedding]) + ']'
+        return vector_str
 
     def _metadata_to_jsonb(self, metadata: Dict[str, Any]) -> str:
         """Преобразование метаданных в JSON строку для PostgreSQL JSONB"""
@@ -89,15 +188,15 @@ class PGVectorStoreService:
             async with self.pool.acquire() as conn:
                 for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
                     doc_id = str(uuid.uuid4())
-                    # Очищаем эмбеддинг
-                    cleaned_embedding = self._validate_and_clean_embedding(embedding)
+                    # Преобразуем эмбеддинг в строку для PostgreSQL
+                    embedding_str = self._embedding_to_pgvector(embedding)
                     # Преобразуем метаданные в JSON строку
                     metadata_json = self._metadata_to_jsonb(metadata)
                     
                     await conn.execute('''
                         INSERT INTO documents (id, content, embedding, metadata)
-                        VALUES ($1, $2, $3, $4::jsonb)
-                    ''', doc_id, doc, cleaned_embedding, metadata_json)
+                        VALUES ($1, $2, $3::vector, $4::jsonb)
+                    ''', doc_id, doc, embedding_str, metadata_json)
                     
                     ids.append(doc_id)
 
@@ -121,25 +220,24 @@ class PGVectorStoreService:
             # Создаем эмбеддинг для запроса
             logger.info(f"Создание эмбеддинга для запроса: {query[:100]}...")
             query_embedding = embedding_service.encode(query)
-            cleaned_embedding = self._validate_and_clean_embedding(query_embedding)
+            query_embedding_str = self._embedding_to_pgvector(query_embedding)
 
-            logger.debug(f"Пример эмбеддинга (первые 5 значений): {cleaned_embedding[:5]}")
-            logger.debug(f"Длина эмбеддинга: {len(cleaned_embedding)}")
+            logger.debug(f"Вектор для поиска: {query_embedding_str[:100]}...")
 
             async with self.pool.acquire() as conn:
                 # Используем косинусное расстояние
-                logger.debug(f"Выполнение поиска с вектором длины: {len(cleaned_embedding)}")
+                logger.debug(f"Выполнение поиска с top_k={top_k}")
                 
                 results = await conn.fetch('''
                     SELECT 
                         id,
                         content,
                         metadata,
-                        1 - (embedding <=> $1) as similarity
+                        1 - (embedding <=> $1::vector) as similarity
                     FROM documents
-                    ORDER BY embedding <=> $1
+                    ORDER BY embedding <=> $1::vector
                     LIMIT $2
-                ''', cleaned_embedding, top_k)
+                ''', query_embedding_str, top_k)
 
                 formatted_results = []
                 for row in results:
@@ -151,7 +249,7 @@ class PGVectorStoreService:
                         "score": float(row["similarity"])
                     })
 
-                logger.debug(f"Найдено {len(formatted_results)} релевантных документов")
+                logger.info(f"Найдено {len(formatted_results)} релевантных документов")
                 return formatted_results
 
         except Exception as e:
@@ -200,3 +298,105 @@ class PGVectorStoreService:
 
 # Global instance
 vector_store = PGVectorStoreService()
+
+database
+
+import asyncpg
+from app.config import settings
+from app.services.embedding import embedding_service
+from loguru import logger
+
+class DatabaseManager:
+    _pool = None
+    _initialized = False
+
+    @classmethod
+    async def get_pool(cls):
+        if cls._pool is None or cls._pool._closed:
+            try:
+                cls._pool = await asyncpg.create_pool(
+                    settings.DATABASE_URL,
+                    min_size=5,
+                    max_size=20,
+                    command_timeout=60,
+                    max_inactive_connection_lifetime=300  # 5 minutes
+                )
+                cls._initialized = True
+                logger.info("PostgreSQL connection pool created successfully")
+                
+                # Initialize database schema с правильной размерностью
+                await cls._init_schema()
+                
+            except Exception as e:
+                logger.error(f"Failed to create database connection pool: {e}")
+                raise
+        return cls._pool
+
+    @classmethod
+    async def _init_schema(cls):
+        """Initialize database tables and indexes"""
+        pool = await cls.get_pool()
+        async with pool.acquire() as conn:
+            # Enable vector extension
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            
+            # Получаем актуальную размерность из сервиса эмбеддингов
+            embedding_dim = embedding_service.embedding_dim
+            
+            # Удаляем старую таблицу если она существует (для пересоздания с правильной размерностью)
+            await conn.execute("DROP TABLE IF EXISTS documents;")
+            
+            # Create documents table с правильной размерностью
+            await conn.execute(f'''
+                CREATE TABLE IF NOT EXISTS documents (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    content TEXT NOT NULL,
+                    embedding VECTOR({embedding_dim}),
+                    metadata JSONB DEFAULT '{{}}',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            ''')
+            
+            # Create index for vector search
+            await conn.execute(f'''
+                CREATE INDEX IF NOT EXISTS documents_embedding_idx 
+                ON documents USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100);
+            ''')
+            
+            # Create metadata index
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS documents_metadata_idx 
+                ON documents USING gin (metadata);
+            ''')
+            
+            logger.info(f"Database schema initialized with embedding dimension: {embedding_dim}")
+
+    @classmethod
+    async def close_pool(cls):
+        if cls._pool and not cls._pool._closed:
+            await cls._pool.close()
+            cls._pool = None
+            cls._initialized = False
+            logger.info("Database connection pool closed")
+
+    @classmethod
+    def is_initialized(cls):
+        return cls._initialized and cls._pool is not None and not cls._pool._closed
+
+# Utility functions
+async def get_database_pool():
+    return await DatabaseManager.get_pool()
+
+async def init_database():
+    """Инициализация базы данных"""
+    await DatabaseManager.get_pool()
+
+async def close_database():
+    """Закрытие соединений с базой данных"""
+    await DatabaseManager.close_pool()
+
+def is_database_initialized():
+    """Проверка инициализации базы данных"""
+    return DatabaseManager.is_initialized()
