@@ -1,5 +1,3 @@
-vector
-
 import uuid
 import json
 import math
@@ -62,15 +60,6 @@ class PGVectorStoreService:
 
         return cleaned_embedding
 
-    def _embedding_to_pgvector(self, embedding) -> str:
-        """Преобразование эмбеддинга в строку для PostgreSQL vector"""
-        cleaned_embedding = self._validate_and_clean_embedding(embedding)
-        
-        # Форматируем каждое число с 6 знаками после запятой
-        # PostgreSQL vector ожидает формат: [1.0, 2.0, 3.0]
-        vector_str = '[' + ','.join([f"{x:.6f}" for x in cleaned_embedding]) + ']'
-        return vector_str
-
     def _metadata_to_jsonb(self, metadata: Dict[str, Any]) -> str:
         """Преобразование метаданных в JSON строку для PostgreSQL JSONB"""
         return json.dumps(metadata, ensure_ascii=False)
@@ -100,15 +89,15 @@ class PGVectorStoreService:
             async with self.pool.acquire() as conn:
                 for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
                     doc_id = str(uuid.uuid4())
-                    # Преобразуем эмбеддинг в строку для PostgreSQL
-                    embedding_str = self._embedding_to_pgvector(embedding)
+                    # Очищаем эмбеддинг
+                    cleaned_embedding = self._validate_and_clean_embedding(embedding)
                     # Преобразуем метаданные в JSON строку
                     metadata_json = self._metadata_to_jsonb(metadata)
                     
                     await conn.execute('''
                         INSERT INTO documents (id, content, embedding, metadata)
-                        VALUES ($1, $2, $3::vector, $4::jsonb)
-                    ''', doc_id, doc, embedding_str, metadata_json)
+                        VALUES ($1, $2, $3, $4::jsonb)
+                    ''', doc_id, doc, cleaned_embedding, metadata_json)
                     
                     ids.append(doc_id)
 
@@ -132,27 +121,25 @@ class PGVectorStoreService:
             # Создаем эмбеддинг для запроса
             logger.info(f"Создание эмбеддинга для запроса: {query[:100]}...")
             query_embedding = embedding_service.encode(query)
-            query_embedding_str = self._embedding_to_pgvector(query_embedding)
-
-            # Логируем первые несколько значений для отладки
             cleaned_embedding = self._validate_and_clean_embedding(query_embedding)
+
             logger.debug(f"Пример эмбеддинга (первые 5 значений): {cleaned_embedding[:5]}")
             logger.debug(f"Длина эмбеддинга: {len(cleaned_embedding)}")
 
             async with self.pool.acquire() as conn:
                 # Используем косинусное расстояние
-                logger.debug(f"Выполнение поиска с вектором: {query_embedding_str[:100]}...")
+                logger.debug(f"Выполнение поиска с вектором длины: {len(cleaned_embedding)}")
                 
                 results = await conn.fetch('''
                     SELECT 
                         id,
                         content,
                         metadata,
-                        1 - (embedding <=> $1::vector) as similarity
+                        1 - (embedding <=> $1) as similarity
                     FROM documents
-                    ORDER BY embedding <=> $1::vector
+                    ORDER BY embedding <=> $1
                     LIMIT $2
-                ''', query_embedding_str, top_k)
+                ''', cleaned_embedding, top_k)
 
                 formatted_results = []
                 for row in results:
