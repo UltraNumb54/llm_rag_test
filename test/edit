@@ -1,3 +1,221 @@
+vector
+
+import uuid
+import json
+import math
+from typing import Any, Dict, List, Optional
+import numpy as np
+
+from app.config import settings
+from app.core.database import get_database_pool, is_database_initialized
+from app.services.embedding import embedding_service
+from loguru import logger
+
+class PGVectorStoreService:
+    def __init__(self):
+        self.embedding_dim = embedding_service.embedding_dim
+        self.pool = None
+        self.initialized = False
+
+    async def init(self):
+        """Initialize connection pool"""
+        try:
+            if not is_database_initialized():
+                logger.info("Инициализация пула соединений с базой данных...")
+                self.pool = await get_database_pool()
+                self.initialized = True
+                logger.info(f"Vector store service initialized with embedding dim: {self.embedding_dim}")
+            else:
+                self.pool = await get_database_pool()
+                self.initialized = True
+        except Exception as e:
+            logger.error(f"Ошибка инициализации vector store: {e}")
+            raise
+
+    async def ensure_connection(self):
+        """Убедиться, что соединение активно"""
+        if not self.initialized or self.pool is None or self.pool._closed:
+            logger.warning("Пул соединений недоступен, переинициализация...")
+            await self.init()
+
+    def _prepare_embedding(self, embedding) -> str:
+        """Подготовка эмбеддинга для PostgreSQL в правильном формате pgvector"""
+        if hasattr(embedding, 'tolist'):
+            embedding_list = embedding.tolist()
+        else:
+            embedding_list = embedding
+
+        # Если это скаляр, создаем вектор нужной размерности
+        if isinstance(embedding_list, (int, float)):
+            embedding_list = [float(embedding_list)] * self.embedding_dim
+            logger.warning(f"Скалярный эмбеддинг расширен до вектора размерности {self.embedding_dim}")
+        elif len(embedding_list) != self.embedding_dim:
+            logger.warning(f"Размерность эмбеддинга ({len(embedding_list)}) не совпадает с ожидаемой ({self.embedding_dim})")
+            # Приводим к нужной размерности
+            if len(embedding_list) > self.embedding_dim:
+                embedding_list = embedding_list[:self.embedding_dim]
+            else:
+                embedding_list.extend([0.0] * (self.embedding_dim - len(embedding_list)))
+
+        # Очищаем от некорректных значений
+        cleaned_embedding = []
+        for x in embedding_list:
+            if isinstance(x, (int, float)) and not (math.isnan(x) or math.isinf(x)):
+                cleaned_embedding.append(float(x))
+            else:
+                cleaned_embedding.append(0.0)
+
+        # Преобразуем в строку в формате pgvector: '[1.0,2.0,3.0]'
+        vector_str = '[' + ','.join(map(str, cleaned_embedding)) + ']'
+        return vector_str
+
+    def _metadata_to_jsonb(self, metadata: Dict[str, Any]) -> str:
+        """Преобразование метаданных в JSON строку для PostgreSQL JSONB"""
+        if metadata is None:
+            return '{}'
+        return json.dumps(metadata, ensure_ascii=False)
+
+    async def add_documents(
+        self, documents: List[str], metadatas: List[Dict[str, Any]] = None
+    ) -> List[str]:
+        """Добавление документов в векторное хранилище PostgreSQL"""
+        if not documents:
+            logger.warning("Попытка добавить пустой список документов")
+            return []
+
+        await self.ensure_connection()
+
+        if metadatas is None:
+            metadatas = [{}] * len(documents)
+        elif len(metadatas) != len(documents):
+            logger.warning("Количество метаданных не совпадает с количеством документов")
+            metadatas = [{}] * len(documents)
+
+        try:
+            # Создаем эмбеддинги
+            logger.info(f"Создание эмбеддингов для {len(documents)} документов...")
+            embeddings = embedding_service.encode(documents)
+
+            ids = []
+            async with self.pool.acquire() as conn:
+                for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
+                    doc_id = str(uuid.uuid4())
+                    # Подготавливаем эмбеддинг
+                    prepared_embedding = self._prepare_embedding(embedding)
+                    # Преобразуем метаданные в JSON строку
+                    metadata_json = self._metadata_to_jsonb(metadata)
+                    
+                    # Явно указываем тип vector для эмбеддинга
+                    await conn.execute('''
+                        INSERT INTO documents (id, content, embedding, metadata)
+                        VALUES ($1, $2, $3::vector, $4::jsonb)
+                    ''', doc_id, doc, prepared_embedding, metadata_json)
+                    
+                    ids.append(doc_id)
+                    
+                    if (i + 1) % 10 == 0:
+                        logger.debug(f"Обработано {i + 1}/{len(documents)} документов")
+
+            logger.success(f"Добавлено {len(documents)} документов в PostgreSQL")
+            return ids
+
+        except Exception as e:
+            logger.error(f"Ошибка добавления документов в PostgreSQL: {e}")
+            raise
+
+    async def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Поиск похожих документов в PostgreSQL"""
+        if top_k is None:
+            top_k = settings.TOP_K
+
+        await self.ensure_connection()
+
+        try:
+            # Создаем эмбеддинг для запроса
+            logger.info(f"Создание эмбеддинга для запроса: {query[:100]}...")
+            query_embedding = embedding_service.encode(query)
+            prepared_embedding = self._prepare_embedding(query_embedding)
+
+            logger.debug(f"Размерность эмбеддинга запроса: {len(prepared_embedding.split(','))}")
+
+            async with self.pool.acquire() as conn:
+                # Используем косинусное расстояние с явным указанием типа vector
+                results = await conn.fetch('''
+                    SELECT 
+                        id,
+                        content,
+                        metadata,
+                        1 - (embedding <=> $1::vector) as similarity
+                    FROM documents
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT $2
+                ''', prepared_embedding, top_k)
+
+                formatted_results = []
+                for row in results:
+                    formatted_results.append({
+                        "id": str(row["id"]),
+                        "document": row["content"],
+                        "metadata": row["metadata"] or {},
+                        "distance": 1 - float(row["similarity"]),
+                        "score": float(row["similarity"])
+                    })
+
+                logger.info(f"Найдено {len(formatted_results)} релевантных документов")
+                return formatted_results
+
+        except Exception as e:
+            logger.error(f"Ошибка поиска в PostgreSQL: {e}")
+            return []
+
+    async def get_collection_info(self) -> Dict[str, Any]:
+        """Получение информации о коллекции документов"""
+        await self.ensure_connection()
+
+        try:
+            async with self.pool.acquire() as conn:
+                count = await conn.fetchval("SELECT COUNT(*) FROM documents")
+                # Получаем информацию о размерности
+                dim_info = await conn.fetchval("""
+                    SELECT atttypmod FROM pg_attribute 
+                    WHERE attrelid = 'documents'::regclass 
+                    AND attname = 'embedding'
+                """)
+                
+                return {
+                    "database": "PostgreSQL",
+                    "table_name": "documents",
+                    "document_count": count,
+                    "status": "healthy",
+                    "vector_dimension": self.embedding_dim,
+                    "actual_dimension": dim_info if dim_info else "unknown"
+                }
+        except Exception as e:
+            logger.error(f"Ошибка получения информации о коллекции: {e}")
+            return {
+                "database": "PostgreSQL",
+                "table_name": "documents",
+                "document_count": 0,
+                "status": "error",
+                "error": str(e)
+            }
+
+    async def clear_collection(self):
+        """Очистка коллекции документов"""
+        await self.ensure_connection()
+        
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("DELETE FROM documents")
+                logger.success("Коллекция документов очищена")
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка очистки коллекции: {e}")
+            return False
+
+# Global instance
+vector_store = PGVectorStoreService()
+
 database
 
 import asyncpg
@@ -5,39 +223,23 @@ from app.config import settings
 from app.services.embedding import embedding_service
 from loguru import logger
 
-# Регистрация типа vector для asyncpg
-async def setup_vector_extension():
-    """Настройка поддержки векторного типа данных для asyncpg"""
-    try:
-        from pgvector.asyncpg import register_vector
-        logger.info("pgvector extension registered successfully")
-        return register_vector
-    except ImportError as e:
-        logger.error("pgvector package not installed. Please install it: pip install pgvector")
-        raise
-
 class DatabaseManager:
     _pool = None
     _initialized = False
-    _vector_dim = None
 
     @classmethod
     async def get_pool(cls):
         if cls._pool is None or cls._pool._closed:
             try:
-                # Получаем актуальную размерность от embedding сервиса
-                cls._vector_dim = embedding_service.embedding_dim
-                
                 cls._pool = await asyncpg.create_pool(
                     settings.DATABASE_URL,
                     min_size=5,
                     max_size=20,
                     command_timeout=60,
-                    max_inactive_connection_lifetime=300,
-                    init=cls._setup_connection
+                    max_inactive_connection_lifetime=300
                 )
                 cls._initialized = True
-                logger.info(f"PostgreSQL connection pool created successfully with vector dim: {cls._vector_dim}")
+                logger.info("PostgreSQL connection pool created successfully")
                 
                 # Initialize database schema
                 await cls._init_schema()
@@ -48,109 +250,98 @@ class DatabaseManager:
         return cls._pool
 
     @classmethod
-    async def _setup_connection(cls, connection):
-        """Настройка соединения с поддержкой векторов"""
-        try:
-            # Регистрируем векторный тип для каждого соединения
-            register_vector = await setup_vector_extension()
-            await register_vector(connection)
-        except Exception as e:
-            logger.error(f"Failed to setup vector extension on connection: {e}")
-            raise
-
-    @classmethod
     async def _init_schema(cls):
         """Initialize database tables and indexes"""
-        if cls._vector_dim is None:
-            cls._vector_dim = embedding_service.embedding_dim
-        
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
+            # Enable vector extension
             try:
-                # Enable vector extension
                 await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                
-                # Проверяем существование таблицы
-                table_exists = await conn.fetchval("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'documents'
-                    );
+                logger.info("pgvector extension enabled successfully")
+            except Exception as e:
+                logger.error(f"Failed to enable vector extension: {e}")
+                # Если расширение недоступно, это критическая ошибка
+                raise
+
+            # Получаем актуальную размерность из сервиса эмбеддингов
+            embedding_dim = embedding_service.embedding_dim
+            
+            # Проверяем существование таблицы
+            table_exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'documents'
+                );
+            """)
+            
+            if table_exists:
+                # Проверяем размерность существующей таблицы
+                current_dim = await conn.fetchval("""
+                    SELECT atttypmod FROM pg_attribute 
+                    WHERE attrelid = 'documents'::regclass 
+                    AND attname = 'embedding'
                 """)
                 
-                if table_exists:
-                    # Проверяем размерность существующего векторного столбца
-                    current_dim = await conn.fetchval("""
-                        SELECT 
-                            pg_catalog.format_type(atttypid, atttypmod) as type
-                        FROM pg_catalog.pg_attribute
-                        WHERE attrelid = 'documents'::regclass 
-                        AND attname = 'embedding'
-                        AND attnum > 0
-                        AND NOT attisdropped;
-                    """)
-                    
-                    if current_dim:
-                        # Извлекаем размерность из типа (например, "vector(384)")
-                        import re
-                        match = re.search(r'vector\((\d+)\)', current_dim)
-                        if match:
-                            existing_dim = int(match.group(1))
-                            if existing_dim != cls._vector_dim:
-                                logger.warning(f"Existing vector dimension ({existing_dim}) differs from expected ({cls._vector_dim}). Recreating table...")
-                                await conn.execute("DROP TABLE IF EXISTS documents;")
-                                await cls._create_table(conn, cls._vector_dim)
-                            else:
-                                logger.info(f"Documents table exists with correct dimension: {cls._vector_dim}")
-                        else:
-                            logger.warning("Could not determine existing vector dimension. Recreating table...")
-                            await conn.execute("DROP TABLE IF EXISTS documents;")
-                            await cls._create_table(conn, cls._vector_dim)
-                    else:
-                        logger.warning("Vector column not found. Recreating table...")
-                        await conn.execute("DROP TABLE IF EXISTS documents;")
-                        await cls._create_table(conn, cls._vector_dim)
+                # Если таблица существует, но с другой размерностью, пересоздаем
+                if current_dim != embedding_dim and current_dim != -1:
+                    logger.warning(f"Размерность таблицы ({current_dim}) не совпадает с требуемой ({embedding_dim}). Пересоздаем таблицу.")
+                    await cls._recreate_table(conn, embedding_dim)
                 else:
-                    # Создаем новую таблицу
-                    await cls._create_table(conn, cls._vector_dim)
-
-            except Exception as e:
-                logger.error(f"Error during schema initialization: {e}")
-                raise
+                    logger.info(f"Таблица documents уже существует с правильной размерностью: {embedding_dim}")
+            else:
+                # Создаем новую таблицу
+                await cls._create_table(conn, embedding_dim)
 
     @classmethod
     async def _create_table(cls, conn, embedding_dim):
-        """Создание таблицы документов с правильной размерностью вектора"""
-        try:
-            await conn.execute(f'''
-                CREATE TABLE documents (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    content TEXT NOT NULL,
-                    embedding VECTOR({embedding_dim}),
-                    metadata JSONB DEFAULT '{{}}'::jsonb,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                );
-            ''')
-            
-            # Create index for vector search
-            await conn.execute(f'''
-                CREATE INDEX documents_embedding_idx 
-                ON documents USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100);
-            ''')
-            
-            # Create metadata index
-            await conn.execute('''
-                CREATE INDEX documents_metadata_idx 
-                ON documents USING gin (metadata);
-            ''')
-            
-            logger.success(f"Documents table created successfully with vector dimension: {embedding_dim}")
-            
-        except Exception as e:
-            logger.error(f"Error creating documents table: {e}")
-            raise
+        """Создание таблицы документов"""
+        await conn.execute(f'''
+            CREATE TABLE IF NOT EXISTS documents (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                content TEXT NOT NULL,
+                embedding VECTOR({embedding_dim}),
+                metadata JSONB DEFAULT '{{}}',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        ''')
+        
+        # Create index for vector search (используем HNSW для лучшей производительности)
+        await conn.execute(f'''
+            CREATE INDEX IF NOT EXISTS documents_embedding_hnsw_idx 
+            ON documents USING hnsw (embedding vector_cosine_ops);
+        ''')
+        
+        # Create metadata index
+        await conn.execute('''
+            CREATE INDEX IF NOT EXISTS documents_metadata_idx 
+            ON documents USING gin (metadata);
+        ''')
+        
+        logger.info(f"Таблица documents создана с размерностью векторов: {embedding_dim}")
+
+    @classmethod
+    async def _recreate_table(cls, conn, embedding_dim):
+        """Пересоздание таблицы с новой размерностью"""
+        # Удаляем старые индексы
+        await conn.execute('DROP INDEX IF EXISTS documents_embedding_hnsw_idx;')
+        await conn.execute('DROP INDEX IF EXISTS documents_metadata_idx;')
+        
+        # Удаляем таблицу
+        await conn.execute('DROP TABLE IF EXISTS documents;')
+        
+        # Создаем заново
+        await cls._create_table(conn, embedding_dim)
+        
+        logger.info(f"Таблица documents пересоздана с новой размерностью: {embedding_dim}")
+
+    @classmethod
+    async def recreate_documents_table(cls):
+        """Публичный метод для принудительного пересоздания таблицы"""
+        pool = await cls.get_pool()
+        async with pool.acquire() as conn:
+            embedding_dim = embedding_service.embedding_dim
+            await cls._recreate_table(conn, embedding_dim)
 
     @classmethod
     async def close_pool(cls):
@@ -158,19 +349,11 @@ class DatabaseManager:
             await cls._pool.close()
             cls._pool = None
             cls._initialized = False
-            cls._vector_dim = None
             logger.info("Database connection pool closed")
 
     @classmethod
     def is_initialized(cls):
         return cls._initialized and cls._pool is not None and not cls._pool._closed
-
-    @classmethod
-    def get_vector_dim(cls):
-        """Получить текущую размерность векторов"""
-        if cls._vector_dim is None:
-            cls._vector_dim = embedding_service.embedding_dim
-        return cls._vector_dim
 
 # Utility functions
 async def get_database_pool():
@@ -184,358 +367,44 @@ async def close_database():
     """Закрытие соединений с базой данных"""
     await DatabaseManager.close_pool()
 
+async def recreate_documents_table():
+    """Пересоздание таблицы документов"""
+    await DatabaseManager.recreate_documents_table()
+
 def is_database_initialized():
     """Проверка инициализации базы данных"""
     return DatabaseManager.is_initialized()
 
-def get_vector_dimension():
-    """Получить размерность векторов из менеджера базы данных"""
-    return DatabaseManager.get_vector_dim()
+delete
 
-vector
-
-import uuid
-import json
-import math
-from typing import Any, Dict, List, Optional, Union
-import numpy as np
-from pgvector.asyncpg import Vector
-
-from app.config import settings
-from app.core.database import (
-    get_database_pool, 
-    is_database_initialized, 
-    get_vector_dimension
-)
-from app.services.embedding import embedding_service
-from loguru import logger
-
-class PGVectorStoreService:
-    def __init__(self):
-        self.pool = None
-        self.initialized = False
-        self.vector_dim = None
-
-    async def init(self):
-        """Initialize connection pool and get vector dimension"""
-        try:
-            if not is_database_initialized():
-                logger.info("Initializing database connection pool...")
-                self.pool = await get_database_pool()
-                self.vector_dim = get_vector_dimension()
-                self.initialized = True
-                logger.info(f"Vector store service initialized with vector dimension: {self.vector_dim}")
-            else:
-                self.pool = await get_database_pool()
-                self.vector_dim = get_vector_dimension()
-                self.initialized = True
-        except Exception as e:
-            logger.error(f"Error initializing vector store: {e}")
-            raise
-
-    async def ensure_connection(self):
-        """Ensure connection is active and initialized"""
-        if not self.initialized or self.pool is None or self.pool._closed:
-            logger.warning("Connection pool not available, reinitializing...")
-            await self.init()
-
-    def _prepare_embedding(self, embedding: Union[np.ndarray, list, float]) -> Vector:
-        """Подготовка эмбеддинга для PostgreSQL с правильным типом Vector"""
-        try:
-            # Если это numpy array, конвертируем в список
-            if isinstance(embedding, np.ndarray):
-                embedding_list = embedding.tolist()
-            elif isinstance(embedding, (int, float)):
-                # Если скалярное значение, создаем вектор нужной размерности
-                embedding_list = [float(embedding)] * self.vector_dim
-                logger.warning(f"Scalar embedding expanded to vector dimension {self.vector_dim}")
-            elif isinstance(embedding, list):
-                embedding_list = embedding
-            else:
-                logger.error(f"Unsupported embedding type: {type(embedding)}")
-                embedding_list = [0.0] * self.vector_dim
-
-            # Проверяем и корректируем размерность
-            if len(embedding_list) != self.vector_dim:
-                logger.warning(f"Embedding dimension mismatch. Expected: {self.vector_dim}, Got: {len(embedding_list)}")
-                
-                if len(embedding_list) > self.vector_dim:
-                    embedding_list = embedding_list[:self.vector_dim]
-                    logger.debug(f"Truncated embedding to dimension {self.vector_dim}")
-                else:
-                    # Дополняем нулями до нужной размерности
-                    padding = [0.0] * (self.vector_dim - len(embedding_list))
-                    embedding_list.extend(padding)
-                    logger.debug(f"Padded embedding to dimension {self.vector_dim}")
-
-            # Очищаем от некорректных значений
-            cleaned_embedding = []
-            for x in embedding_list:
-                if isinstance(x, (int, float)) and not (math.isnan(x) or math.isinf(x)):
-                    cleaned_embedding.append(float(x))
-                else:
-                    cleaned_embedding.append(0.0)
-                    logger.warning(f"Invalid value in embedding replaced with 0.0: {x}")
-
-            # Создаем Vector объект для pgvector
-            return Vector(cleaned_embedding)
-
-        except Exception as e:
-            logger.error(f"Error preparing embedding: {e}")
-            # Возвращаем вектор нулей как fallback
-            return Vector([0.0] * self.vector_dim)
-
-    def _metadata_to_jsonb(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Преобразование метаданных в формат, поддерживаемый PostgreSQL JSONB"""
-        try:
-            # Убеждаемся, что все ключи и значения JSON-сериализуемы
-            cleaned_metadata = {}
-            for key, value in metadata.items():
-                try:
-                    # Проверяем, что значение можно сериализовать в JSON
-                    json.dumps(value)
-                    cleaned_metadata[key] = value
-                except (TypeError, ValueError):
-                    # Если нельзя, преобразуем в строку
-                    cleaned_metadata[key] = str(value)
-                    logger.warning(f"Metadata value for key '{key}' converted to string: {value}")
-            
-            return cleaned_metadata
-        except Exception as e:
-            logger.error(f"Error processing metadata: {e}")
-            return {}
-
-    async def add_documents(
-        self, documents: List[str], metadatas: List[Dict[str, Any]] = None
-    ) -> List[str]:
-        """Добавление документов в векторное хранилище PostgreSQL"""
-        if not documents:
-            logger.warning("Attempt to add empty document list")
-            return []
-
-        await self.ensure_connection()
-
-        if metadatas is None:
-            metadatas = [{}] * len(documents)
-        elif len(metadatas) != len(documents):
-            logger.warning(f"Metadata count ({len(metadatas)}) doesn't match document count ({len(documents)})")
-            # Дополняем или обрезаем метаданные
-            if len(metadatas) < len(documents):
-                metadatas.extend([{}] * (len(documents) - len(metadatas)))
-            else:
-                metadatas = metadatas[:len(documents)]
-
-        try:
-            # Создаем эмбеддинги
-            logger.info(f"Generating embeddings for {len(documents)} documents...")
-            embeddings = embedding_service.encode(documents)
-
-            ids = []
-            async with self.pool.acquire() as conn:
-                # Используем COPY для массовой вставки для лучшей производительности
-                for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
-                    doc_id = str(uuid.uuid4())
-                    
-                    # Подготавливаем данные
-                    prepared_embedding = self._prepare_embedding(embedding)
-                    cleaned_metadata = self._metadata_to_jsonb(metadata)
-                    
-                    try:
-                        await conn.execute('''
-                            INSERT INTO documents (id, content, embedding, metadata)
-                            VALUES ($1, $2, $3, $4)
-                        ''', doc_id, doc, prepared_embedding, cleaned_metadata)
-                        
-                        ids.append(doc_id)
-                        logger.debug(f"Document {doc_id} added successfully")
-                        
-                    except Exception as e:
-                        logger.error(f"Error adding document {i}: {e}")
-                        logger.debug(f"Problematic document: {doc[:100]}...")
-                        logger.debug(f"Embedding type: {type(prepared_embedding)}, dim: {len(prepared_embedding.to_list()) if hasattr(prepared_embedding, 'to_list') else 'unknown'}")
-                        # Продолжаем добавление остальных документов
-                        continue
-
-            logger.success(f"Successfully added {len(ids)} out of {len(documents)} documents to PostgreSQL")
-            return ids
-
-        except Exception as e:
-            logger.error(f"Critical error adding documents to PostgreSQL: {e}")
-            logger.exception(e)
-            raise
-
-    async def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Поиск похожих документов в PostgreSQL"""
-        if top_k is None:
-            top_k = settings.TOP_K
-
-        await self.ensure_connection()
-
-        try:
-            # Создаем эмбеддинг для запроса
-            logger.info(f"Generating embedding for query: {query[:100]}...")
-            query_embedding = embedding_service.encode(query)
-            prepared_embedding = self._prepare_embedding(query_embedding)
-
-            logger.debug(f"Query embedding dimension: {len(prepared_embedding.to_list())}")
-
-            async with self.pool.acquire() as conn:
-                # Используем косинусное расстояние
-                results = await conn.fetch('''
-                    SELECT 
-                        id,
-                        content,
-                        metadata,
-                        1 - (embedding <=> $1) as similarity
-                    FROM documents
-                    WHERE 1 - (embedding <=> $1) > 0.1  -- Фильтр по минимальной релевантности
-                    ORDER BY embedding <=> $1
-                    LIMIT $2
-                ''', prepared_embedding, top_k)
-
-                formatted_results = []
-                for row in results:
-                    try:
-                        formatted_results.append({
-                            "id": str(row["id"]),
-                            "document": row["content"],
-                            "metadata": dict(row["metadata"]) if row["metadata"] else {},
-                            "distance": 1 - float(row["similarity"]),
-                            "score": float(row["similarity"]),
-                            "relevance": float(row["similarity"])  # Для совместимости
-                        })
-                    except Exception as e:
-                        logger.error(f"Error formatting result row: {e}")
-                        continue
-
-                logger.info(f"Found {len(formatted_results)} relevant documents with scores: {[r['score']:.3f} for r in formatted_results]")
-                return formatted_results
-
-        except Exception as e:
-            logger.error(f"Error searching in PostgreSQL: {e}")
-            logger.exception(e)
-            return []
-
-    async def get_collection_info(self) -> Dict[str, Any]:
-        """Получение информации о коллекции документов"""
-        await self.ensure_connection()
-
-        try:
-            async with self.pool.acquire() as conn:
-                # Получаем количество документов
-                count = await conn.fetchval("SELECT COUNT(*) FROM documents")
-                
-                # Получаем пример документа для проверки структуры
-                sample = await conn.fetchrow("SELECT id, content, embedding, metadata FROM documents LIMIT 1")
-                
-                return {
-                    "database": "PostgreSQL",
-                    "table_name": "documents",
-                    "document_count": count,
-                    "vector_dimension": self.vector_dim,
-                    "status": "healthy",
-                    "has_data": count > 0,
-                    "sample_document": {
-                        "id": str(sample["id"]) if sample else None,
-                        "content_preview": sample["content"][:100] + "..." if sample and sample["content"] else None,
-                        "embedding_dim": len(sample["embedding"].to_list()) if sample and hasattr(sample["embedding"], "to_list") else None,
-                        "metadata_keys": list(sample["metadata"].keys()) if sample and sample["metadata"] else None
-                    } if sample else None
-                }
-        except Exception as e:
-            logger.error(f"Error getting collection info: {e}")
-            logger.exception(e)
-            return {
-                "database": "PostgreSQL",
-                "table_name": "documents",
-                "document_count": 0,
-                "vector_dimension": self.vector_dim,
-                "status": "error",
-                "error": str(e),
-                "has_data": False
-            }
-
-    async def delete_document(self, document_id: str) -> bool:
-        """Удаление документа по ID"""
-        await self.ensure_connection()
-        
-        try:
-            async with self.pool.acquire() as conn:
-                result = await conn.execute('''
-                    DELETE FROM documents WHERE id = $1
-                ''', document_id)
-                
-                deleted_count = int(result.split()[-1])
-                logger.info(f"Deleted {deleted_count} documents with ID: {document_id}")
-                return deleted_count > 0
-                
-        except Exception as e:
-            logger.error(f"Error deleting document {document_id}: {e}")
-            return False
-
-    async def clear_collection(self) -> bool:
-        """Очистка всей коллекции документов"""
-        await self.ensure_connection()
-        
-        try:
-            async with self.pool.acquire() as conn:
-                await conn.execute("TRUNCATE TABLE documents RESTART IDENTITY")
-                logger.warning("All documents have been deleted from the collection")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error clearing collection: {e}")
-            return False
-
-# Global instance
-vector_store = PGVectorStoreService()
-
-config 
-
+import asyncio
+import sys
 import os
-from pydantic_settings import BaseSettings
-from pathlib import Path
 
-class Settings(BaseSettings):
-    # Application settings
-    APP_NAME: str = "RAG_vLLM_API"
-    DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
-    HOST: str = os.getenv("HOST", "0.0.0.0")
-    PORT: int = int(os.getenv("PORT", "8000"))
-    
-    # Database settings
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/rag_db")
-    
-    # Vector store settings
-    TOP_K: int = int(os.getenv("TOP_K", "5"))
-    SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.1"))
-    
-    # Embedding model
-    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-    EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "384"))  # Default for MiniLM
-    
-    # Reranker model
-    RERANKER_MODEL: str = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-    
-    # LLM settings
-    LLM_MODEL_NAME: str = os.getenv("LLM_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct-AWQ")
-    VLLM_API_URL: str = os.getenv("VLLM_API_URL", "http://localhost:8000/v1/completions")
-    
-    # File processing
-    UPLOAD_DIR: Path = Path(os.getenv("UPLOAD_DIR", "uploads"))
-    MAX_UPLOAD_SIZE: int = int(os.getenv("MAX_UPLOAD_SIZE", "10485760"))  # 10MB
-    
-    # Logging
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    LOG_FILE: Path = Path(os.getenv("LOG_FILE", "logs/app.log"))
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+# Добавляем корневую директорию в путь
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-settings = Settings()
+from app.core.database import recreate_documents_table
+from app.services.vector_store import vector_store
 
-# Ensure directories exist
-settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-settings.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+async def main():
+    try:
+        print("Пересоздание таблицы documents...")
+        await recreate_documents_table()
+        print("✅ Таблица успешно пересоздана!")
+        
+        # Инициализируем vector_store для проверки
+        await vector_store.init()
+        info = await vector_store.get_collection_info()
+        print(f"📊 Информация о БД: {info}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+    finally:
+        # Закрываем соединения
+        from app.core.database import close_database
+        await close_database()
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
