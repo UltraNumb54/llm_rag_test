@@ -1,54 +1,161 @@
-1. Обновленный app/config.py
-from typing import List, Optional
-from pydantic import Field, validator
-from pydantic_settings import BaseSettings
+🔐 Настройка пароля для пользователя PostgreSQL
+bash
+# Установите пароль для пользователя rag_user
+sudo -u postgres psql -c "ALTER USER rag_user WITH PASSWORD 'secure_password';"
 
-class Settings(BaseSettings):
-    # Настройки сервера
-    HOST: str = "0.0.0.0"
-    PORT: int = 8000
+# Проверьте подключение с паролем
+psql -h localhost -U rag_user -d rag_db -W
+📦 Дополнительные зависимости PostgreSQL
+Добавьте в requirements.txt:
 
-    # Модели для embedding и реранкера
-    EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+txt
+# Добавьте эти строки к существующим зависимостям
+psycopg2-binary==2.9.7
+sqlalchemy==2.0.23
+alembic==1.12.1
+Установите их:
 
-    # Настройки vLLM
-    VLLM_BASE_URL: str = "http://localhost:8000/v1"
-    VLLM_API_KEY: str = "none"
-    VLLM_MODEL_NAME: str = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+bash
+pip install psycopg2-binary sqlalchemy alembic
+🔧 Разделение main.py и start_server.py
+app/main.py (только определение FastAPI приложения)
+python
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-    # Настройки PostgreSQL
-    DATABASE_URL: str = "postgresql://rag_user:password@localhost:5432/rag_db"
+from app.config import settings
+from app.core.database import init_database, close_database
+from app.services.vector_store import vector_store
+from app.services.vllm_manager import vllm_manager, cleanup_all_vllm_processes
+
+# Import routers
+from app.routers import health, chat, files
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await init_database()
+    await vector_store.init()
     
-    # Настройки обработки документов
-    CHUNK_SIZE: int = 500
-    CHUNK_OVERLAP: int = 50
-    MAX_FILE_SIZE: int = 100 * 1024 * 1024  # 100MB
+    # Запускаем vLLM сервер
+    print("🔄 Инициализация vLLM сервера...")
+    if not vllm_manager.start_vllm_server():
+        print("❌ Не удалось запустить vLLM сервер. Приложение будет остановлено.")
+        raise RuntimeError("VLLM server failed to start")
+    
+    yield
+    
+    # Shutdown
+    vllm_manager.stop_vllm_server()
+    cleanup_all_vllm_processes()
+    await close_database()
 
-    # Настройки поиска
-    TOP_K: int = 3
-    RERANK_TOP_K: int = 2
-    MAX_CONCURRENT_REQUESTS: int = 10
+# Создание приложения FastAPI
+app = FastAPI(
+    title="RAG System with vLLM",
+    description="Система RAG с vLLM и PostgreSQL для технической поддержки",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
-    # Безопасность
-    API_KEY: Optional[str] = None
-    CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    @validator("DATABASE_URL")
-    def validate_database_url(cls, v):
-        if not v.startswith("postgresql://"):
-            raise ValueError("DATABASE_URL must start with postgresql://")
-        return v
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+# Include routers
+app.include_router(health.router, prefix="/api/v1", tags=["health"])
+app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
+app.include_router(files.router, prefix="/api/v1", tags=["files"])
 
-settings = Settings()
+@app.get("/")
+async def root():
+    return {"message": "RAG System with vLLM and PostgreSQL", "status": "running"}
 
-2. Обновленный app/core/database.py
+@app.get("/api/v1")
+async def api_info():
+    return {
+        "name": "RAG API",
+        "version": "1.0.0",
+        "models": {
+            "llm": settings.VLLM_MODEL_NAME,
+            "embedding": settings.EMBEDDING_MODEL,
+            "reranker": settings.RERANKER_MODEL
+        }
+    }
+start_server.py (запуск сервера)
+python
+import os
+import sys
+import uvicorn
+from app.config import settings
+from app.utils.logger import setup_logger
+
+def setup_environment():
+    """Настройка окружения"""
+    os.makedirs("uploads", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("static", exist_ok=True)
+
+def print_startup_info():
+    """Выводит информацию о запуске"""
+    print("\n" + "="*60)
+    print("🚀 Запуск RAG системы с vLLM и PostgreSQL")
+    print("="*60)
+    print("Конфигурация:")
+    print(f"   - Сервер: http://{settings.HOST}:{settings.PORT}")
+    print(f"   - API: http://{settings.HOST}:{settings.PORT}/api/v1")
+    print(f"   - vLLM: {settings.VLLM_BASE_URL}")
+    print(f"   - Модель: {settings.VLLM_MODEL_NAME}")
+    print(f"   - База данных: PostgreSQL с pgvector")
+    print(f"   - Документация: http://{settings.HOST}:{settings.PORT}/docs")
+    print()
+    print("Доступные endpoints:")
+    print("   GET  /                   - Информация о API")
+    print("   POST /api/v1/upload      - Загрузка файлов")
+    print("   POST /api/v1/chat        - Чат с RAG")
+    print("   GET  /api/v1/health      - Статус системы")
+    print("="*60)
+    print()
+
+def main():
+    """Основная функция запуска"""
+    setup_environment()
+    setup_logger()
+    
+    print_startup_info()
+
+    try:
+        uvicorn.run(
+            "app.main:app",
+            host=settings.HOST,
+            port=settings.PORT,
+            reload=True,
+            log_level="info",
+            access_log=True,
+        )
+    except KeyboardInterrupt:
+        print("\n🛑 Получен сигнал прерывания...")
+    except Exception as e:
+        print(f"\n❌ Неожиданная ошибка: {e}")
+    finally:
+        print("👋 Приложение завершено")
+
+if __name__ == "__main__":
+    main()
+🗄️ Обновленный app/core/database.py
+python
 import asyncpg
-import numpy as np
 from app.config import settings
 from loguru import logger
 
@@ -88,7 +195,7 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS documents (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     content TEXT NOT NULL,
-                    embedding VECTOR(384), -- размерность для multilingual-MiniLM-L12-v2
+                    embedding VECTOR(384),
                     metadata JSONB DEFAULT '{}',
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -126,8 +233,8 @@ async def init_database():
 
 async def close_database():
     await DatabaseManager.close_pool()
-
-3. Новый app/services/vector_store.py с PostgreSQL
+🔄 Обновленный app/services/vector_store.py (pgvector)
+python
 import uuid
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -169,13 +276,13 @@ class PGVectorStoreService:
             async with self.pool.acquire() as conn:
                 for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
                     doc_id = str(uuid.uuid4())
-                    # Convert embedding to PostgreSQL vector format
-                    embedding_vector = f"[{','.join(map(str, embedding))}]"
+                    # Convert embedding to list for PostgreSQL
+                    embedding_list = embedding.tolist() if hasattr(embedding, 'tolist') else embedding
                     
                     await conn.execute('''
                         INSERT INTO documents (id, content, embedding, metadata)
-                        VALUES ($1, $2, $3::vector, $4)
-                    ''', doc_id, doc, embedding_vector, metadata)
+                        VALUES ($1, $2, $3, $4)
+                    ''', doc_id, doc, embedding_list, metadata)
                     
                     ids.append(doc_id)
 
@@ -194,7 +301,7 @@ class PGVectorStoreService:
         try:
             # Создаем эмбеддинг для запроса
             query_embedding = embedding_service.encode(query)
-            query_vector = f"[{','.join(map(str, query_embedding))}]"
+            query_embedding_list = query_embedding.tolist() if hasattr(query_embedding, 'tolist') else query_embedding
 
             async with self.pool.acquire() as conn:
                 # Используем косинусное расстояние
@@ -203,16 +310,16 @@ class PGVectorStoreService:
                         id,
                         content,
                         metadata,
-                        1 - (embedding <=> $1::vector) as similarity
+                        1 - (embedding <=> $1) as similarity
                     FROM documents
-                    ORDER BY embedding <=> $1::vector
+                    ORDER BY embedding <=> $1
                     LIMIT $2
-                ''', query_vector, top_k)
+                ''', query_embedning_list, top_k)
 
                 formatted_results = []
                 for row in results:
                     formatted_results.append({
-                        "id": row["id"],
+                        "id": str(row["id"]),
                         "document": row["content"],
                         "metadata": row["metadata"] or {},
                         "distance": 1 - float(row["similarity"]),
@@ -260,211 +367,7 @@ class PGVectorStoreService:
 
 # Global instance
 vector_store = PGVectorStoreService()
-4. Обновленный app/main.py
-import os
-import sys
-import uvicorn
-import asyncio
-from contextlib import asynccontextmanager
-
-from app.config import settings
-from app.core.database import init_database, close_database
-from app.services.vector_store import vector_store
-from app.services.vllm_manager import vllm_manager, cleanup_all_vllm_processes
-from app.utils.logger import setup_logger
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-
-# Import routers
-from app.routers import health, chat, files
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    await init_database()
-    await vector_store.init()
-    
-    # Запускаем vLLM сервер
-    print("Инициализация vLLM сервера...")
-    if not vllm_manager.start_vllm_server():
-        print("Не удалось запустить vLLM сервер. Приложение будет остановлено.")
-        raise RuntimeError("VLLM server failed to start")
-    
-    yield
-    
-    # Shutdown
-    vllm_manager.stop_vllm_server()
-    cleanup_all_vllm_processes()
-    await close_database()
-
-app = FastAPI(
-    title="RAG System with vLLM",
-    description="Система RAG с vLLM и PostgreSQL для технической поддержки",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Include routers
-app.include_router(health.router, prefix="/api/v1", tags=["health"])
-app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
-app.include_router(files.router, prefix="/api/v1", tags=["files"])
-
-@app.get("/")
-async def root():
-    return {"message": "RAG System with vLLM and PostgreSQL", "status": "running"}
-
-@app.get("/api/v1")
-async def api_info():
-    return {
-        "name": "RAG API",
-        "version": "1.0.0",
-        "models": {
-            "llm": settings.VLLM_MODEL_NAME,
-            "embedding": settings.EMBEDDING_MODEL,
-            "reranker": settings.RERANKER_MODEL
-        }
-    }
-
-def setup_environment():
-    """Настройка окружения"""
-    os.makedirs("uploads", exist_ok=True)
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("static", exist_ok=True)
-
-def print_startup_info():
-    """Выводит информацию о запуске"""
-    print("\n" + "="*60)
-    print("🚀 Запуск RAG системы с vLLM и PostgreSQL")
-    print("="*60)
-    print("Конфигурация:")
-    print(f"- Веб-интерфейс: http://{settings.HOST}:{settings.PORT}")
-    print(f"- API: http://{settings.HOST}:{settings.PORT}/api/v1")
-    print(f"- vLLM сервер: {settings.VLLM_BASE_URL}")
-    print(f"- Модель: {settings.VLLM_MODEL_NAME}")
-    print(f"- База данных: PostgreSQL с pgvector")
-    print(f"- Документация: http://{settings.HOST}:{settings.PORT}/docs")
-    print()
-    print("Доступные endpoints:")
-    print("GET  /                   - Информация о API")
-    print("   POST /api/v1/upload      - Загрузка файлов")
-    print("   POST /api/v1/chat        - Чат с RAG")
-    print("   GET  /api/v1/health      - Статус системы")
-    print("="*60)
-    print()
-
-def main():
-    """Основная функция запуска"""
-    setup_environment()
-    setup_logger()
-    
-    print_startup_info()
-
-    try:
-        uvicorn.run(
-            "app.main:app",
-            host=settings.HOST,
-            port=settings.PORT,
-            reload=True,
-            log_level="info",
-            access_log=True,
-        )
-    except KeyboardInterrupt:
-        print("\nПолучен сигнал прерывания...")
-    except Exception as e:
-        print(f"\nНеожиданная ошибка: {e}")
-    finally:
-        print("Приложение завершено")
-
-if __name__ == "__main__":
-    main()
-5. Обновленный app/routers/health.py
-python
-import os
-import psutil
-import asyncpg
-from app.config import settings
-from app.core.database import get_database_pool
-from app.services.llm_service import llm_service
-from fastapi import APIRouter, HTTPException
-from loguru import logger
-
-router = APIRouter()
-
-@router.get("/health")
-async def health_check():
-    """Проверка здоровья всех компонентов системы"""
-    checks = {}
-
-    # Проверка PostgreSQL
-    try:
-        pool = await get_database_pool()
-        async with pool.acquire() as conn:
-            # Проверяем подключение и расширение vector
-            await conn.fetchval("SELECT 1")
-            vector_ext = await conn.fetchval(
-                "SELECT installed_version FROM pg_available_extensions WHERE name = 'vector'"
-            )
-            checks["postgresql"] = {
-                "status": "healthy", 
-                "message": "Connected with vector extension",
-                "vector_version": vector_ext
-            }
-    except Exception as e:
-        checks["postgresql"] = {"status": "unhealthy", "message": str(e)}
-
-    # Проверка vLLM
-    try:
-        test_response = llm_service.generate("Ответь 'OK'", max_tokens=5)
-        checks["vllm"] = {
-            "status": "healthy",
-            "message": "Connected",
-            "test_response": test_response.strip() if test_response else "No response"
-        }
-    except Exception as e:
-        checks["vllm"] = {"status": "unhealthy", "message": str(e)}
-
-    # Проверка памяти
-    memory = psutil.virtual_memory()
-    checks["memory"] = {
-        "total_gb": round(memory.total / (1024**3), 2),
-        "available_gb": round(memory.available / (1024**3), 2),
-        "used_percent": memory.percent,
-    }
-
-    # Проверка диска
-    disk = psutil.disk_usage("/")
-    checks["disk"] = {
-        "total_gb": round(disk.total / (1024**3), 2),
-        "free_gb": round(disk.free / (1024**3), 2),
-        "used_percent": disk.percent,
-    }
-
-    # Общий статус
-    critical_services_healthy = all(
-        checks[service]["status"] == "healthy" for service in ["postgresql", "vllm"]
-    )
-
-    overall_status = "healthy" if critical_services_healthy else "degraded"
-
-    return {
-        "status": overall_status, 
-        "version": "1.0.0", 
-        "checks": checks
-    }
-6. Обновленный app/routers/chat.py
+💬 Обновленный app/routers/chat.py
 python
 from typing import List, Optional
 from app.config import settings
@@ -578,165 +481,4 @@ async def get_conversation(conversation_id: str):
     """Получить историю диалога"""
     history = conversation_store.get(conversation_id, [])
     return {"conversation_id": conversation_id, "history": history}
-7. Создайте файл app/routers/files.py
-python
-import os
-import aiofiles
-from typing import List
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from app.services.file_processor import file_processor
-from app.services.vector_store import vector_store
-from loguru import logger
-
-router = APIRouter()
-
-@router.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
-    """Загрузка и обработка файлов"""
-    uploaded_files = []
-    processed_documents = []
-    
-    for file in files:
-        try:
-            # Проверяем размер файла
-            file.file.seek(0, 2)  # Переходим в конец файла
-            file_size = file.file.tell()
-            file.file.seek(0)  # Возвращаемся в начало
-            
-            if file_size > 100 * 1024 * 1024:  # 100MB
-                raise HTTPException(status_code=400, detail=f"Файл {file.filename} слишком большой")
-            
-            # Сохраняем файл
-            file_path = f"uploads/{file.filename}"
-            async with aiofiles.open(file_path, 'wb') as f:
-                content = await file.read()
-                await f.write(content)
-            
-            # Обрабатываем файл
-            documents = await file_processor.process_file(file_path)
-            processed_documents.extend(documents)
-            
-            uploaded_files.append({
-                "filename": file.filename,
-                "size": file_size,
-                "document_count": len(documents)
-            })
-            
-            logger.info(f"Файл {file.filename} обработан, извлечено {len(documents)} документов")
-            
-        except Exception as e:
-            logger.error(f"Ошибка обработки файла {file.filename}: {e}")
-            raise HTTPException(status_code=500, detail=f"Ошибка обработки файла {file.filename}: {str(e)}")
-    
-    # Добавляем документы в векторное хранилище
-    if processed_documents:
-        document_ids = await vector_store.add_documents(processed_documents)
-        logger.info(f"Добавлено {len(document_ids)} документов в векторное хранилище")
-    
-    return {
-        "message": f"Успешно обработано {len(uploaded_files)} файлов",
-        "uploaded_files": uploaded_files,
-        "total_documents": len(processed_documents)
-    }
-
-@router.get("/files")
-async def list_uploaded_files():
-    """Список загруженных файлов"""
-    try:
-        files = []
-        if os.path.exists("uploads"):
-            for filename in os.listdir("uploads"):
-                file_path = os.path.join("uploads", filename)
-                if os.path.isfile(file_path):
-                    files.append({
-                        "filename": filename,
-                        "size": os.path.getsize(file_path),
-                        "modified": os.path.getmtime(file_path)
-                    })
-        return {"files": files}
-    except Exception as e:
-        logger.error(f"Ошибка получения списка файлов: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка получения списка файлов")
-8. Обновленный requirements.txt
-txt
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.5.0
-pydantic-settings==2.1.0
-loguru==0.7.2
-asyncpg==0.29.0
-sentence-transformers==2.2.2
-transformers==4.35.2
-torch==2.1.2
-numpy==1.24.3
-psutil==5.9.6
-python-multipart==0.0.6
-python-dotenv==1.0.0
-aiofiles==23.2.1
-requests==2.31.0
-chromadb==0.4.22
-openai==1.3.9
-
-9. Создайте скрипт инициализации БД scripts/init_database.py
-python
-#!/usr/bin/env python3
-import asyncio
-import asyncpg
-import sys
-import os
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from app.config import settings
-
-async def init_database():
-    """Инициализация базы данных и пользователя"""
-    try:
-        # Подключаемся к базе данных postgres для создания нашей БД
-        conn = await asyncpg.connect(
-            database="postgres",
-            user="postgres",
-            password="your_password_here",  # замените на ваш пароль
-            host="localhost"
-        )
-        
-        # Создаем базу данных и пользователя
-        await conn.execute("""
-            CREATE USER rag_user WITH PASSWORD 'secure_password';
-            CREATE DATABASE rag_db OWNER rag_user;
-            GRANT ALL PRIVILEGES ON DATABASE rag_db TO rag_user;
-        """)
-        
-        await conn.close()
-        
-        # Теперь подключаемся к новой базе данных для настройки расширений
-        conn = await asyncpg.connect(settings.DATABASE_URL)
-        
-        # Включаем расширение vector
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        
-        print("База данных успешно инициализирована")
-        print(f"   URL: {settings.DATABASE_URL}")
-        
-        await conn.close()
-        
-    except Exception as e:
-        print(f"Ошибка инициализации базы данных: {e}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    asyncio.run(init_database())
-
-Дополнительные команды для настройки
-# Дайте права на выполнение скрипта
-chmod +x scripts/init_database.py
-
-# Создайте пользователя и базу данных (если еще не создали)
-sudo -u postgres createuser --createdb --createrole --superuser rag_user
-sudo -u postgres createdb -O rag_user rag_db
-
-# Или используйте интерактивный режим psql
-sudo -u postgres psql -c "CREATE USER rag_user WITH PASSWORD 'secure_password';"
-sudo -u postgres psql -c "CREATE DATABASE rag_db OWNER rag_user;"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE rag_db TO rag_user;"
 
