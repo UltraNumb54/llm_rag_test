@@ -1,410 +1,269 @@
+@classmethod
+async def _create_table(cls, conn, embedding_dim):
+    """Создание таблицы документов с оптимизированными индексами"""
+    await conn.execute(f'''
+        CREATE TABLE IF NOT EXISTS documents (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            content TEXT NOT NULL,
+            embedding VECTOR({embedding_dim}),
+            metadata JSONB DEFAULT '{{}}',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+    ''')
+    
+    # Оптимизированный HNSW индекс с лучшими параметрами
+    await conn.execute(f'''
+        CREATE INDEX IF NOT EXISTS documents_embedding_hnsw_idx 
+        ON documents USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64);
+    ''')
+    
+    # Дополнительный индекс для полнотекстового поиска
+    await conn.execute('''
+        CREATE INDEX IF NOT EXISTS documents_content_gin_idx 
+        ON documents USING gin (to_tsvector('russian', content));
+    ''')
+    
+    # Индекс для метаданных
+    await conn.execute('''
+        CREATE INDEX IF NOT EXISTS documents_metadata_idx 
+        ON documents USING gin (metadata);
+    ''')
+    
+    logger.info(f"Таблица documents создана с оптимизированными индексами")
+
+
+database
+
 vector
 
-import uuid
-import json
-import math
-from typing import Any, Dict, List, Optional
-import numpy as np
+async def search(self, query: str, top_k: Optional[int] = None, min_score: float = 0.3) -> List[Dict[str, Any]]:
+    """Улучшенный поиск с гибридным подходом"""
+    if top_k is None:
+        top_k = settings.TOP_K
 
-from app.config import settings
-from app.core.database import get_database_pool, is_database_initialized
-from app.services.embedding import embedding_service
-from loguru import logger
+    await self.ensure_connection()
 
-class PGVectorStoreService:
-    def __init__(self):
-        self.embedding_dim = embedding_service.embedding_dim
-        self.pool = None
-        self.initialized = False
+    try:
+        # Создаем эмбеддинг для запроса
+        logger.info(f"Создание эмбеддинга для запроса: {query[:100]}...")
+        query_embedding = embedding_service.encode(query)
+        prepared_embedding = self._prepare_embedding(query_embedding)
 
-    async def init(self):
-        """Initialize connection pool"""
-        try:
-            if not is_database_initialized():
-                logger.info("Инициализация пула соединений с базой данных...")
-                self.pool = await get_database_pool()
-                self.initialized = True
-                logger.info(f"Vector store service initialized with embedding dim: {self.embedding_dim}")
-            else:
-                self.pool = await get_database_pool()
-                self.initialized = True
-        except Exception as e:
-            logger.error(f"Ошибка инициализации vector store: {e}")
-            raise
-
-    async def ensure_connection(self):
-        """Убедиться, что соединение активно"""
-        if not self.initialized or self.pool is None or self.pool._closed:
-            logger.warning("Пул соединений недоступен, переинициализация...")
-            await self.init()
-
-    def _prepare_embedding(self, embedding) -> str:
-        """Подготовка эмбеддинга для PostgreSQL в правильном формате pgvector"""
-        if hasattr(embedding, 'tolist'):
-            embedding_list = embedding.tolist()
-        else:
-            embedding_list = embedding
-
-        # Если это скаляр, создаем вектор нужной размерности
-        if isinstance(embedding_list, (int, float)):
-            embedding_list = [float(embedding_list)] * self.embedding_dim
-            logger.warning(f"Скалярный эмбеддинг расширен до вектора размерности {self.embedding_dim}")
-        elif len(embedding_list) != self.embedding_dim:
-            logger.warning(f"Размерность эмбеддинга ({len(embedding_list)}) не совпадает с ожидаемой ({self.embedding_dim})")
-            # Приводим к нужной размерности
-            if len(embedding_list) > self.embedding_dim:
-                embedding_list = embedding_list[:self.embedding_dim]
-            else:
-                embedding_list.extend([0.0] * (self.embedding_dim - len(embedding_list)))
-
-        # Очищаем от некорректных значений
-        cleaned_embedding = []
-        for x in embedding_list:
-            if isinstance(x, (int, float)) and not (math.isnan(x) or math.isinf(x)):
-                cleaned_embedding.append(float(x))
-            else:
-                cleaned_embedding.append(0.0)
-
-        # Преобразуем в строку в формате pgvector: '[1.0,2.0,3.0]'
-        vector_str = '[' + ','.join(map(str, cleaned_embedding)) + ']'
-        return vector_str
-
-    def _metadata_to_jsonb(self, metadata: Dict[str, Any]) -> str:
-        """Преобразование метаданных в JSON строку для PostgreSQL JSONB"""
-        if metadata is None:
-            return '{}'
-        return json.dumps(metadata, ensure_ascii=False)
-
-    async def add_documents(
-        self, documents: List[str], metadatas: List[Dict[str, Any]] = None
-    ) -> List[str]:
-        """Добавление документов в векторное хранилище PostgreSQL"""
-        if not documents:
-            logger.warning("Попытка добавить пустой список документов")
-            return []
-
-        await self.ensure_connection()
-
-        if metadatas is None:
-            metadatas = [{}] * len(documents)
-        elif len(metadatas) != len(documents):
-            logger.warning("Количество метаданных не совпадает с количеством документов")
-            metadatas = [{}] * len(documents)
-
-        try:
-            # Создаем эмбеддинги
-            logger.info(f"Создание эмбеддингов для {len(documents)} документов...")
-            embeddings = embedding_service.encode(documents)
-
-            ids = []
-            async with self.pool.acquire() as conn:
-                for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
-                    doc_id = str(uuid.uuid4())
-                    # Подготавливаем эмбеддинг
-                    prepared_embedding = self._prepare_embedding(embedding)
-                    # Преобразуем метаданные в JSON строку
-                    metadata_json = self._metadata_to_jsonb(metadata)
-                    
-                    # Явно указываем тип vector для эмбеддинга
-                    await conn.execute('''
-                        INSERT INTO documents (id, content, embedding, metadata)
-                        VALUES ($1, $2, $3::vector, $4::jsonb)
-                    ''', doc_id, doc, prepared_embedding, metadata_json)
-                    
-                    ids.append(doc_id)
-                    
-                    if (i + 1) % 10 == 0:
-                        logger.debug(f"Обработано {i + 1}/{len(documents)} документов")
-
-            logger.success(f"Добавлено {len(documents)} документов в PostgreSQL")
-            return ids
-
-        except Exception as e:
-            logger.error(f"Ошибка добавления документов в PostgreSQL: {e}")
-            raise
-
-    async def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Поиск похожих документов в PostgreSQL"""
-        if top_k is None:
-            top_k = settings.TOP_K
-
-        await self.ensure_connection()
-
-        try:
-            # Создаем эмбеддинг для запроса
-            logger.info(f"Создание эмбеддинга для запроса: {query[:100]}...")
-            query_embedding = embedding_service.encode(query)
-            prepared_embedding = self._prepare_embedding(query_embedding)
-
-            logger.debug(f"Размерность эмбеддинга запроса: {len(prepared_embedding.split(','))}")
-
-            async with self.pool.acquire() as conn:
-                # Используем косинусное расстояние с явным указанием типа vector
-                results = await conn.fetch('''
+        async with self.pool.acquire() as conn:
+            # Устанавливаем параметры поиска для лучшей точности
+            await conn.execute("SET hnsw.ef_search = 100;")  # Увеличиваем точность поиска HNSW
+            
+            # Комбинированный поиск: векторный + полнотекстовый
+            results = await conn.fetch('''
+                WITH vector_search AS (
                     SELECT 
                         id,
                         content,
                         metadata,
                         1 - (embedding <=> $1::vector) as similarity
                     FROM documents
+                    WHERE embedding <=> $1::vector < 0.8  -- Фильтр по порогу расстояния
                     ORDER BY embedding <=> $1::vector
+                    LIMIT $2 * 2  # Берем в 2 раза больше для последующей фильтрации
+                ),
+                text_search AS (
+                    SELECT 
+                        id,
+                        content,
+                        metadata,
+                        ts_rank(to_tsvector('russian', content), plainto_tsquery('russian', $3)) as ts_rank
+                    FROM documents
+                    WHERE to_tsvector('russian', content) @@ plainto_tsquery('russian', $3)
+                    ORDER BY ts_rank DESC
                     LIMIT $2
-                ''', prepared_embedding, top_k)
+                )
+                -- Объединяем результаты с весами
+                SELECT 
+                    vs.id,
+                    vs.content,
+                    vs.metadata,
+                    vs.similarity as vector_score,
+                    COALESCE(ts.ts_rank, 0) as text_score,
+                    (vs.similarity * 0.7 + COALESCE(ts.ts_rank, 0) * 0.3) as combined_score
+                FROM vector_search vs
+                LEFT JOIN text_search ts ON vs.id = ts.id
+                WHERE vs.similarity > $4  # Порог по векторному сходству
+                ORDER BY combined_score DESC
+                LIMIT $2
+            ''', prepared_embedding, top_k, query, min_score)
 
-                formatted_results = []
-                for row in results:
-                    formatted_results.append({
-                        "id": str(row["id"]),
-                        "document": row["content"],
-                        "metadata": row["metadata"] or {},
-                        "distance": 1 - float(row["similarity"]),
-                        "score": float(row["similarity"])
-                    })
+            formatted_results = []
+            for row in results:
+                formatted_results.append({
+                    "id": str(row["id"]),
+                    "document": row["content"],
+                    "metadata": row["metadata"] or {},
+                    "distance": 1 - float(row["vector_score"]),
+                    "score": float(row["combined_score"]),
+                    "vector_score": float(row["vector_score"]),
+                    "text_score": float(row["text_score"])
+                })
 
-                logger.info(f"Найдено {len(formatted_results)} релевантных документов")
-                return formatted_results
+            logger.info(f"Найдено {len(formatted_results)} релевантных документов (улучшенный поиск)")
+            return formatted_results
 
-        except Exception as e:
-            logger.error(f"Ошибка поиска в PostgreSQL: {e}")
-            return []
+    except Exception as e:
+        logger.error(f"Ошибка улучшенного поиска: {e}")
+        # Fallback к простому векторному поиску
+        return await self._fallback_search(query, top_k, prepared_embedding)
 
-    async def get_collection_info(self) -> Dict[str, Any]:
-        """Получение информации о коллекции документов"""
-        await self.ensure_connection()
+async def _fallback_search(self, query: str, top_k: int, prepared_embedding: str) -> List[Dict[str, Any]]:
+    """Резервный поиск только по векторам"""
+    try:
+        async with self.pool.acquire() as conn:
+            await conn.execute("SET hnsw.ef_search = 80;")
+            
+            results = await conn.fetch('''
+                SELECT 
+                    id,
+                    content,
+                    metadata,
+                    1 - (embedding <=> $1::vector) as similarity
+                FROM documents
+                ORDER BY embedding <=> $1::vector
+                LIMIT $2
+            ''', prepared_embedding, top_k)
 
-        try:
-            async with self.pool.acquire() as conn:
-                count = await conn.fetchval("SELECT COUNT(*) FROM documents")
-                # Получаем информацию о размерности
-                dim_info = await conn.fetchval("""
-                    SELECT atttypmod FROM pg_attribute 
-                    WHERE attrelid = 'documents'::regclass 
-                    AND attname = 'embedding'
-                """)
-                
-                return {
-                    "database": "PostgreSQL",
-                    "table_name": "documents",
-                    "document_count": count,
-                    "status": "healthy",
-                    "vector_dimension": self.embedding_dim,
-                    "actual_dimension": dim_info if dim_info else "unknown"
-                }
-        except Exception as e:
-            logger.error(f"Ошибка получения информации о коллекции: {e}")
-            return {
-                "database": "PostgreSQL",
-                "table_name": "documents",
-                "document_count": 0,
-                "status": "error",
-                "error": str(e)
-            }
+            formatted_results = []
+            for row in results:
+                formatted_results.append({
+                    "id": str(row["id"]),
+                    "document": row["content"],
+                    "metadata": row["metadata"] or {},
+                    "distance": 1 - float(row["similarity"]),
+                    "score": float(row["similarity"])
+                })
 
-    async def clear_collection(self):
-        """Очистка коллекции документов"""
-        await self.ensure_connection()
-        
-        try:
-            async with self.pool.acquire() as conn:
-                await conn.execute("DELETE FROM documents")
-                logger.success("Коллекция документов очищена")
-                return True
-        except Exception as e:
-            logger.error(f"Ошибка очистки коллекции: {e}")
-            return False
+            return formatted_results
+    except Exception as e:
+        logger.error(f"Ошибка резервного поиска: {e}")
+        return []
 
-# Global instance
-vector_store = PGVectorStoreService()
+config
 
-database
+import os
+from typing import Optional
+from pydantic_settings import BaseSettings
 
+class Settings(BaseSettings):
+    # ... существующие настройки ...
+    
+    # Новые настройки для улучшения поиска
+    SEARCH_EF_SEARCH: int = 100  # Параметр точности HNSW поиска
+    SEARCH_MIN_SCORE: float = 0.3  # Минимальный порог релевантности
+    SEARCH_HYBRID_WEIGHT_VECTOR: float = 0.7  # Вес векторного поиска
+    SEARCH_HYBRID_WEIGHT_TEXT: float = 0.3  # Вес полнотекстового поиска
+    
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+
+Создайте скрипт для настройки PostgreSQL scripts/optimize_db.py:
+
+python
+import asyncio
 import asyncpg
 from app.config import settings
-from app.services.embedding import embedding_service
 from loguru import logger
 
-class DatabaseManager:
-    _pool = None
-    _initialized = False
-
-    @classmethod
-    async def get_pool(cls):
-        if cls._pool is None or cls._pool._closed:
-            try:
-                cls._pool = await asyncpg.create_pool(
-                    settings.DATABASE_URL,
-                    min_size=5,
-                    max_size=20,
-                    command_timeout=60,
-                    max_inactive_connection_lifetime=300
-                )
-                cls._initialized = True
-                logger.info("PostgreSQL connection pool created successfully")
-                
-                # Initialize database schema
-                await cls._init_schema()
-                
-            except Exception as e:
-                logger.error(f"Failed to create database connection pool: {e}")
-                raise
-        return cls._pool
-
-    @classmethod
-    async def _init_schema(cls):
-        """Initialize database tables and indexes"""
-        pool = await cls.get_pool()
-        async with pool.acquire() as conn:
-            # Enable vector extension
-            try:
-                await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                logger.info("pgvector extension enabled successfully")
-            except Exception as e:
-                logger.error(f"Failed to enable vector extension: {e}")
-                # Если расширение недоступно, это критическая ошибка
-                raise
-
-            # Получаем актуальную размерность из сервиса эмбеддингов
-            embedding_dim = embedding_service.embedding_dim
-            
-            # Проверяем существование таблицы
-            table_exists = await conn.fetchval("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = 'documents'
-                );
-            """)
-            
-            if table_exists:
-                # Проверяем размерность существующей таблицы
-                current_dim = await conn.fetchval("""
-                    SELECT atttypmod FROM pg_attribute 
-                    WHERE attrelid = 'documents'::regclass 
-                    AND attname = 'embedding'
-                """)
-                
-                # Если таблица существует, но с другой размерностью, пересоздаем
-                if current_dim != embedding_dim and current_dim != -1:
-                    logger.warning(f"Размерность таблицы ({current_dim}) не совпадает с требуемой ({embedding_dim}). Пересоздаем таблицу.")
-                    await cls._recreate_table(conn, embedding_dim)
-                else:
-                    logger.info(f"Таблица documents уже существует с правильной размерностью: {embedding_dim}")
-            else:
-                # Создаем новую таблицу
-                await cls._create_table(conn, embedding_dim)
-
-    @classmethod
-    async def _create_table(cls, conn, embedding_dim):
-        """Создание таблицы документов"""
-        await conn.execute(f'''
-            CREATE TABLE IF NOT EXISTS documents (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                content TEXT NOT NULL,
-                embedding VECTOR({embedding_dim}),
-                metadata JSONB DEFAULT '{{}}',
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
-        ''')
-        
-        # Create index for vector search (используем HNSW для лучшей производительности)
-        await conn.execute(f'''
-            CREATE INDEX IF NOT EXISTS documents_embedding_hnsw_idx 
-            ON documents USING hnsw (embedding vector_cosine_ops);
-        ''')
-        
-        # Create metadata index
-        await conn.execute('''
-            CREATE INDEX IF NOT EXISTS documents_metadata_idx 
-            ON documents USING gin (metadata);
-        ''')
-        
-        logger.info(f"Таблица documents создана с размерностью векторов: {embedding_dim}")
-
-    @classmethod
-    async def _recreate_table(cls, conn, embedding_dim):
-        """Пересоздание таблицы с новой размерностью"""
-        # Удаляем старые индексы
-        await conn.execute('DROP INDEX IF EXISTS documents_embedding_hnsw_idx;')
-        await conn.execute('DROP INDEX IF EXISTS documents_metadata_idx;')
-        
-        # Удаляем таблицу
-        await conn.execute('DROP TABLE IF EXISTS documents;')
-        
-        # Создаем заново
-        await cls._create_table(conn, embedding_dim)
-        
-        logger.info(f"Таблица documents пересоздана с новой размерностью: {embedding_dim}")
-
-    @classmethod
-    async def recreate_documents_table(cls):
-        """Публичный метод для принудительного пересоздания таблицы"""
-        pool = await cls.get_pool()
-        async with pool.acquire() as conn:
-            embedding_dim = embedding_service.embedding_dim
-            await cls._recreate_table(conn, embedding_dim)
-
-    @classmethod
-    async def close_pool(cls):
-        if cls._pool and not cls._pool._closed:
-            await cls._pool.close()
-            cls._pool = None
-            cls._initialized = False
-            logger.info("Database connection pool closed")
-
-    @classmethod
-    def is_initialized(cls):
-        return cls._initialized and cls._pool is not None and not cls._pool._closed
-
-# Utility functions
-async def get_database_pool():
-    return await DatabaseManager.get_pool()
-
-async def init_database():
-    """Инициализация базы данных"""
-    await DatabaseManager.get_pool()
-
-async def close_database():
-    """Закрытие соединений с базой данных"""
-    await DatabaseManager.close_pool()
-
-async def recreate_documents_table():
-    """Пересоздание таблицы документов"""
-    await DatabaseManager.recreate_documents_table()
-
-def is_database_initialized():
-    """Проверка инициализации базы данных"""
-    return DatabaseManager.is_initialized()
-
-delete
-
-import asyncio
-import sys
-import os
-
-# Добавляем корневую директорию в путь
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from app.core.database import recreate_documents_table
-from app.services.vector_store import vector_store
-
-async def main():
+async def optimize_postgresql():
+    """Оптимизация PostgreSQL для векторного поиска"""
     try:
-        print("Пересоздание таблицы documents...")
-        await recreate_documents_table()
-        print("✅ Таблица успешно пересоздана!")
+        conn = await asyncpg.connect(settings.DATABASE_URL)
         
-        # Инициализируем vector_store для проверки
-        await vector_store.init()
-        info = await vector_store.get_collection_info()
-        print(f"📊 Информация о БД: {info}")
+        # Оптимизация параметров PostgreSQL для векторного поиска
+        optimizations = [
+            "SET shared_preload_libraries = 'vector';",
+            "SET work_mem = '256MB';",
+            "SET maintenance_work_mem = '512MB';",
+            "SET effective_cache_size = '2GB';",
+            "SET random_page_cost = 1.1;",
+            "SET effective_io_concurrency = 200;"
+        ]
+        
+        for optimization in optimizations:
+            try:
+                await conn.execute(optimization)
+                logger.info(f"Применена оптимизация: {optimization}")
+            except Exception as e:
+                logger.warning(f"Не удалось применить {optimization}: {e}")
+        
+        await conn.close()
+        logger.success("Оптимизация PostgreSQL завершена")
         
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
-    finally:
-        # Закрываем соединения
-        from app.core.database import close_database
-        await close_database()
+        logger.error(f"Ошибка оптимизации PostgreSQL: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(optimize_postgresql())
 
+def encode(self, texts):
+    # ... существующий код ...
+    
+    # Создаем эмбеддинги с нормализацией
+    embeddings = self.model.encode(
+        texts, 
+        convert_to_tensor=False, 
+        normalize_embeddings=True,  # Важно для косинусного расстояния
+        show_progress_bar=False
+    )
+    
+    # Дополнительная нормализация для безопасности
+    if isinstance(embeddings, np.ndarray):
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings / np.where(norms == 0, 1, norms)
+    
+    # ... остальной код ...
+
+import asyncio
+import numpy as np
+from app.core.database import get_database_pool
+from app.services.embedding import embedding_service
+
+async def check_embedding_quality():
+    """Проверка качества эмбеддингов в базе данных"""
+    pool = await get_database_pool()
+    
+    async with pool.acquire() as conn:
+        # Проверяем среднюю длину векторов
+        result = await conn.fetchval('''
+            SELECT AVG(array_length(embedding::text::float8[], 1)) 
+            FROM documents 
+            LIMIT 100
+        ''')
+        print(f"Средняя размерность векторов: {result}")
+        
+        # Проверяем нормализацию
+        result = await conn.fetch('''
+            SELECT 
+                id,
+                sqrt(sum(unnest::double precision * unnest::double precision)) as norm
+            FROM (
+                SELECT id, unnest(string_to_array(trim(embedding::text, '[]'), ','))::float8 as unnest
+                FROM documents 
+                LIMIT 50
+            ) t
+            GROUP BY id
+        ''')
+        
+        norms = [row['norm'] for row in result]
+        print(f"Средняя норма векторов: {np.mean(norms):.4f} (+/- {np.std(norms):.4f})")
+        
+        # Проверка на NaN значения
+        nan_check = await conn.fetchval('''
+            SELECT COUNT(*) 
+            FROM documents 
+            WHERE embedding::text LIKE '%NaN%' OR embedding::text LIKE '%Inf%'
+        ''')
+        print(f"Найдено некорректных векторов: {nan_check}")
+
+if __name__ == "__main__":
+    asyncio.run(check_embedding_quality())
