@@ -2,6 +2,7 @@ vector
 
 import uuid
 import json
+import math
 from typing import Any, Dict, List, Optional
 import numpy as np
 
@@ -37,15 +38,37 @@ class PGVectorStoreService:
             logger.warning("Пул соединений недоступен, переинициализация...")
             await self.init()
 
-    def _embedding_to_pgvector(self, embedding) -> str:
-        """Преобразование эмбеддинга в строку для PostgreSQL vector"""
+    def _validate_and_clean_embedding(self, embedding) -> List[float]:
+        """Валидация и очистка эмбеддинга"""
         if hasattr(embedding, 'tolist'):
             embedding_list = embedding.tolist()
         else:
             embedding_list = embedding
-            
-        # Преобразуем в строку формата: [1.0, 2.0, 3.0, ...]
-        vector_str = '[' + ','.join(str(x) for x in embedding_list) + ']'
+
+        # Проверяем длину вектора
+        if len(embedding_list) != self.embedding_dim:
+            logger.warning(f"Размерность эмбеддинга ({len(embedding_list)}) не совпадает с ожидаемой ({self.embedding_dim})")
+
+        # Проверяем на наличие nan и inf, заменяем на 0
+        cleaned_embedding = []
+        for x in embedding_list:
+            if isinstance(x, (int, float)):
+                if math.isnan(x) or math.isinf(x):
+                    cleaned_embedding.append(0.0)
+                else:
+                    cleaned_embedding.append(float(x))
+            else:
+                cleaned_embedding.append(0.0)
+
+        return cleaned_embedding
+
+    def _embedding_to_pgvector(self, embedding) -> str:
+        """Преобразование эмбеддинга в строку для PostgreSQL vector"""
+        cleaned_embedding = self._validate_and_clean_embedding(embedding)
+        
+        # Форматируем каждое число с 6 знаками после запятой
+        # PostgreSQL vector ожидает формат: [1.0, 2.0, 3.0]
+        vector_str = '[' + ','.join([f"{x:.6f}" for x in cleaned_embedding]) + ']'
         return vector_str
 
     def _metadata_to_jsonb(self, metadata: Dict[str, Any]) -> str:
@@ -107,11 +130,19 @@ class PGVectorStoreService:
 
         try:
             # Создаем эмбеддинг для запроса
+            logger.info(f"Создание эмбеддинга для запроса: {query[:100]}...")
             query_embedding = embedding_service.encode(query)
             query_embedding_str = self._embedding_to_pgvector(query_embedding)
 
+            # Логируем первые несколько значений для отладки
+            cleaned_embedding = self._validate_and_clean_embedding(query_embedding)
+            logger.debug(f"Пример эмбеддинга (первые 5 значений): {cleaned_embedding[:5]}")
+            logger.debug(f"Длина эмбеддинга: {len(cleaned_embedding)}")
+
             async with self.pool.acquire() as conn:
                 # Используем косинусное расстояние
+                logger.debug(f"Выполнение поиска с вектором: {query_embedding_str[:100]}...")
+                
                 results = await conn.fetch('''
                     SELECT 
                         id,
@@ -182,290 +213,3 @@ class PGVectorStoreService:
 
 # Global instance
 vector_store = PGVectorStoreService()
-
-files proc
-
-import os
-import asyncio
-from typing import List, Dict, Any
-import aiofiles
-from loguru import logger
-
-class FileProcessor:
-    async def process_file(self, file_path: str, filename: str) -> List[str]:
-        """Асинхронная обработка файла и извлечение текста"""
-        try:
-            logger.info(f"Обработка файла: {filename}")
-            
-            # Определяем тип файла по расширению
-            ext = os.path.splitext(filename)[1].lower()
-            
-            if ext == '.txt':
-                return await self._process_txt(file_path, filename)
-            elif ext == '.pdf':
-                return await self._process_pdf(file_path, filename)
-            elif ext in ['.doc', '.docx']:
-                return await self._process_docx(file_path, filename)
-            elif ext == '.md':
-                return await self._process_markdown(file_path, filename)
-            else:
-                logger.warning(f"Неподдерживаемый формат файла: {ext}")
-                return []
-                
-        except Exception as e:
-            logger.error(f"Ошибка обработки файла {filename}: {e}")
-            return []
-
-    async def _process_txt(self, file_path: str, filename: str) -> List[str]:
-        """Обработка текстовых файлов"""
-        try:
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                content = await f.read()
-            
-            if not content.strip():
-                return []
-                
-            # Разбиваем на чанки
-            chunks = self._split_text(content)
-            logger.info(f"Текстовый файл обработан, создано {len(chunks)} чанков")
-            return chunks
-            
-        except Exception as e:
-            logger.error(f"Ошибка чтения текстового файла: {e}")
-            return []
-
-    async def _process_pdf(self, file_path: str, filename: str) -> List[str]:
-        """Обработка PDF файлов"""
-        try:
-            # Для PDF используем синхронную библиотеку, но запускаем в отдельном потоке
-            return await asyncio.get_event_loop().run_in_executor(
-                None, self._process_pdf_sync, file_path, filename
-            )
-        except Exception as e:
-            logger.error(f"Ошибка обработки PDF: {e}")
-            return []
-
-    def _process_pdf_sync(self, file_path: str, filename: str) -> List[str]:
-        """Синхронная обработка PDF"""
-        try:
-            import PyPDF2
-            
-            chunks = []
-            with open(file_path, 'rb') as f:
-                pdf_reader = PyPDF2.PdfReader(f)
-                
-                for page_num in range(len(pdf_reader.pages)):
-                    page = pdf_reader.pages[page_num]
-                    text = page.extract_text()
-                    
-                    if text.strip():
-                        page_chunks = self._split_text(text)
-                        chunks.extend(page_chunks)
-            
-            logger.info(f"PDF файл обработан, создано {len(chunks)} чанков")
-            return chunks
-            
-        except ImportError:
-            logger.error("PyPDF2 не установлен. Установите: pip install PyPDF2")
-            return []
-        except Exception as e:
-            logger.error(f"Ошибка синхронной обработки PDF: {e}")
-            return []
-
-    async def _process_docx(self, file_path: str, filename: str) -> List[str]:
-        """Обработка DOCX файлов"""
-        try:
-            return await asyncio.get_event_loop().run_in_executor(
-                None, self._process_docx_sync, file_path, filename
-            )
-        except Exception as e:
-            logger.error(f"Ошибка обработки DOCX: {e}")
-            return []
-
-    def _process_docx_sync(self, file_path: str, filename: str) -> List[str]:
-        """Синхронная обработка DOCX"""
-        try:
-            import docx
-            
-            doc = docx.Document(file_path)
-            full_text = []
-            
-            for paragraph in doc.paragraphs:
-                if paragraph.text.strip():
-                    full_text.append(paragraph.text)
-            
-            text = '\n'.join(full_text)
-            chunks = self._split_text(text)
-            
-            logger.info(f"DOCX файл обработан, создано {len(chunks)} чанков")
-            return chunks
-            
-        except ImportError:
-            logger.error("python-docx не установлен. Установите: pip install python-docx")
-            return []
-        except Exception as e:
-            logger.error(f"Ошибка синхронной обработки DOCX: {e}")
-            return []
-
-    async def _process_markdown(self, file_path: str, filename: str) -> List[str]:
-        """Обработка Markdown файлов"""
-        try:
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                content = await f.read()
-            
-            # Упрощенная обработка Markdown - удаляем разметку
-            import re
-            text = re.sub(r'#+\s?', '', content)  # Удаляем заголовки
-            text = re.sub(r'\*{1,2}(.*?)\*{1,2}', r'\1', text)  # Удаляем жирный/курсив
-            text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)  # Удаляем ссылки
-            
-            chunks = self._split_text(text)
-            logger.info(f"Markdown файл обработан, создано {len(chunks)} чанков")
-            return chunks
-            
-        except Exception as e:
-            logger.error(f"Ошибка обработки Markdown: {e}")
-            return []
-
-    def _split_text(self, text: str) -> List[str]:
-        """Разбивка текста на перекрывающиеся чанки"""
-        from app.config import settings
-        
-        chunk_size = settings.CHUNK_SIZE
-        chunk_overlap = settings.CHUNK_OVERLAP
-        
-        if len(text) <= chunk_size:
-            return [text] if text.strip() else []
-        
-        chunks = []
-        start = 0
-        
-        while start < len(text):
-            end = start + chunk_size
-            
-            # Если не конец текста, пытаемся закончить на границе предложения
-            if end < len(text):
-                # Ищем последнюю точку, восклицательный или вопросительный знак
-                sentence_end = max(
-                    text.rfind('.', start, end),
-                    text.rfind('!', start, end),
-                    text.rfind('?', start, end),
-                    text.rfind('\n', start, end)
-                )
-                
-                if sentence_end > start and sentence_end - start > chunk_size // 2:
-                    end = sentence_end + 1
-            
-            chunk = text[start:end].strip()
-            if chunk:
-                chunks.append(chunk)
-            
-            start = end - chunk_overlap
-            
-            # Защита от бесконечного цикла
-            if start >= len(text):
-                break
-        
-        return chunks
-
-files
-
-import os
-import asyncio
-import aiofiles
-from app.config import settings
-from app.services.file_processor import FileProcessor
-from app.services.vector_store import vector_store
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
-from loguru import logger
-
-router = APIRouter()
-file_processor = FileProcessor()
-
-async def process_file_background(file_path: str, filename: str):
-    """Асинхронная фоновая обработка файла"""
-    try:
-        logger.info(f"Начата фоновая обработка файла: {filename}")
-        
-        # Обрабатываем файл и получаем документы
-        documents = await file_processor.process_file(file_path, filename)
-        
-        if documents:
-            logger.info(f"Найдено {len(documents)} документов для добавления в базу")
-            
-            # Создаем метаданные для каждого документа
-            metadatas = [{"filename": filename, "chunk_index": i} for i in range(len(documents))]
-            
-            # Добавляем документы в векторное хранилище
-            document_ids = await vector_store.add_documents(documents, metadatas)
-            logger.success(f"Файл {filename} успешно обработан, добавлено {len(document_ids)} документов")
-        else:
-            logger.warning(f"Файл {filename} не содержит извлекаемого текста")
-            
-    except Exception as e:
-        logger.error(f"Ошибка обработки файла {filename}: {e}")
-    finally:
-        # Очищаем временный файл
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logger.debug(f"Временный файл {file_path} удален")
-        except Exception as e:
-            logger.warning(f"Не удалось удалить временный файл {file_path}: {e}")
-
-@router.post("/upload")
-async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    try:
-        # Проверяем размер файла
-        content = await file.read()
-        if len(content) > settings.MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Файл слишком большой. Максимальный размер: {settings.MAX_FILE_SIZE // (1024 * 1024)}MB",
-            )
-
-        # Сохраняем файл
-        upload_dir = "uploads"
-        os.makedirs(upload_dir, exist_ok=True)
-        file_path = os.path.join(upload_dir, file.filename)
-
-        async with aiofiles.open(file_path, "wb") as f:
-            await f.write(content)
-
-        # Запускаем фоновую задачу с правильным вызовом
-        background_tasks.add_task(process_file_background, file_path, file.filename)
-
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "message": "Файл загружен и отправлен на обработку",
-        }
-
-    except Exception as e:
-        logger.error(f"Ошибка загрузки файла: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/files")
-async def list_files():
-    """Список загруженных файлов"""
-    try:
-        upload_dir = "uploads"
-        if not os.path.exists(upload_dir):
-            return {"files": []}
-
-        files = []
-        for filename in os.listdir(upload_dir):
-            file_path = os.path.join(upload_dir, filename)
-            stats = os.stat(file_path)
-            files.append(
-                {
-                    "filename": filename,
-                    "size": stats.st_size,
-                    "uploaded_at": stats.st_ctime,
-                }
-            )
-
-        return {"files": files}
-    except Exception as e:
-        logger.error(f"Ошибка получения списка файлов: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
