@@ -1,433 +1,217 @@
-<!doctype html>
-<html lang="ru">
-    <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Ассистент технической поддержки</title>
-        <style>
-            /* Ваш CSS код остаётся без изменений */
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
+import asyncpg
+from app.config import settings
+from loguru import logger
 
-            body {
-                font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-                line-height: 1.6;
-                color: #333;
-                background-color: #f5f7fa;
-                min-height: 100vh;
-            }
+class DatabaseManager:
+    _pool = None
 
-            /* ... остальной CSS код ... */
-        </style>
-    </head>
-    <body>
-        <div class="app-container">
-            <!-- Header -->
-            <div class="header">
-                <h1>RAG Ассистент технической поддержки</h1>
-                <div class="header-actions">
-                    <button class="new-chat-btn" onclick="createNewChat()">
-                        + Новый чат
-                    </button>
-                </div>
-            </div>
+    @classmethod
+    async def get_pool(cls):
+        if cls._pool is None:
+            try:
+                cls._pool = await asyncpg.create_pool(
+                    settings.DATABASE_URL,
+                    min_size=5,
+                    max_size=20,
+                    command_timeout=60
+                )
+                logger.info("PostgreSQL connection pool created successfully")
+                
+                # Initialize database schema
+                await cls._init_schema()
+                
+            except Exception as e:
+                logger.error(f"Failed to create database connection pool: {e}")
+                raise
+        return cls._pool
 
-            <!-- Left Chats Panel -->
-            <div class="chats-panel">
-                <div class="chats-header">Мои чаты</div>
-                <div class="chats-list" id="chatsList">
-                    <!-- Chat items will be dynamically added here -->
-                </div>
-            </div>
+    @classmethod
+    async def _init_schema(cls):
+        """Initialize database tables and indexes"""
+        pool = await cls.get_pool()
+        async with pool.acquire() as conn:
+            # Enable vector extension
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            
+            # Create documents table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS documents (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    content TEXT NOT NULL,
+                    embedding VECTOR(384),
+                    metadata JSONB DEFAULT '{}',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            ''')
+            
+            # Create index for vector search
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS documents_embedding_idx 
+                ON documents USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100);
+            ''')
+            
+            # Create metadata index
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS documents_metadata_idx 
+                ON documents USING gin (metadata);
+            ''')
+            
+            logger.info("Database schema initialized successfully")
 
-            <!-- Main Chat Area -->
-            <div class="chat-container">
-                <div class="chat-messages" id="chat">
-                    <div class="message system">
-                        Добро пожаловать! Создайте новый чат или выберите существующий.
-                    </div>
-                </div>
-                <div class="input-area">
-                    <input
-                        type="text"
-                        id="message"
-                        placeholder="Введите ваш вопрос..."
-                        autocomplete="off"
-                        disabled
-                    />
-                    <button onclick="sendMessage()" id="sendBtn" disabled>
-                        Отправить
-                    </button>
-                </div>
-            </div>
+    @classmethod
+    async def close_pool(cls):
+        if cls._pool:
+            await cls._pool.close()
+            cls._pool = None
+            logger.info("Database connection pool closed")
 
-            <!-- Right Sidebar -->
-            <div class="sidebar">
-                <div class="upload-section" id="uploadSection">
-                    <h3>Загрузка документов</h3>
-                    <input
-                        type="file"
-                        id="fileInput"
-                        accept=".pdf,.docx,.txt,.md"
-                    />
-                    <button onclick="uploadFile()">Загрузить файл</button>
-                    <div id="uploadStatus"></div>
-                </div>
-            </div>
-        </div>
+# Utility functions
+async def get_database_pool():
+    return await DatabaseManager.get_pool()
 
-        <script>
-            // State management
-            let chats = JSON.parse(localStorage.getItem("rag-chats")) || [];
-            let currentChatId = null;
-            let showUploadSection = true;
+async def init_database():
+    """Инициализация базы данных - должна быть завершена ДО запуска приложения"""
+    await DatabaseManager.get_pool()
 
-            // Initialize the app
-            document.addEventListener("DOMContentLoaded", function () {
-                initializeApp();
-            });
+async def close_database():
+    """Закрытие соединений с базой данных"""
+    await DatabaseManager.close_pool()
 
-            function initializeApp() {
-                renderChatsList();
-                updateUploadSectionVisibility();
 
-                // Focus on message input
-                document.getElementById("message").focus();
+import uuid
+from typing import Any, Dict, List, Optional
+import numpy as np
 
-                // Enter key support
-                document.getElementById("message").addEventListener("keypress", function (e) {
-                    if (e.key === "Enter") {
-                        sendMessage();
-                    }
-                });
+from app.config import settings
+from app.core.database import get_database_pool
+from app.services.embedding import embedding_service
+from loguru import logger
 
-                // Load last active chat if exists
-                if (chats.length > 0) {
-                    const lastActiveChat = chats.find((chat) => chat.isActive) || chats[chats.length - 1];
-                    switchChat(lastActiveChat.id);
+class PGVectorStoreService:
+    def __init__(self):
+        self.embedding_dim = 384  # Размерность для multilingual-MiniLM-L12-v2
+        self.pool = None
+
+    async def init(self):
+        """Initialize connection pool - должна быть завершена ДО использования"""
+        if self.pool is None:
+            self.pool = await get_database_pool()
+            logger.info("Vector store service initialized")
+
+    async def add_documents(
+        self, documents: List[str], metadatas: List[Dict[str, Any]] = None
+    ) -> List[str]:
+        """Добавление документов в векторное хранилище PostgreSQL"""
+        if not documents:
+            logger.warning("Попытка добавить пустой список документов")
+            return []
+
+        if metadatas is None:
+            metadatas = [{}] * len(documents)
+        elif len(metadatas) != len(documents):
+            logger.warning("Количество метаданных не совпадает с количеством документов")
+            metadatas = [{}] * len(documents)
+
+        try:
+            # Создаем эмбеддинги
+            logger.info(f"Создание эмбеддингов для {len(documents)} документов...")
+            embeddings = embedding_service.encode(documents)
+
+            ids = []
+            async with self.pool.acquire() as conn:
+                for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
+                    doc_id = str(uuid.uuid4())
+                    # Convert embedding to list for PostgreSQL
+                    embedding_list = embedding.tolist() if hasattr(embedding, 'tolist') else embedding
+                    
+                    await conn.execute('''
+                        INSERT INTO documents (id, content, embedding, metadata)
+                        VALUES ($1, $2, $3, $4)
+                    ''', doc_id, doc, embedding_list, metadata)
+                    
+                    ids.append(doc_id)
+
+            logger.success(f"Добавлено {len(documents)} документов в PostgreSQL")
+            return ids
+
+        except Exception as e:
+            logger.error(f"Ошибка добавления документов в PostgreSQL: {e}")
+            raise
+
+    async def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Поиск похожих документов в PostgreSQL"""
+        if top_k is None:
+            top_k = settings.TOP_K
+
+        try:
+            # Создаем эмбеддинг для запроса
+            query_embedding = embedding_service.encode(query)
+            query_embedding_list = query_embedding.tolist() if hasattr(query_embedding, 'tolist') else query_embedding
+
+            async with self.pool.acquire() as conn:
+                # Используем косинусное расстояние
+                results = await conn.fetch('''
+                    SELECT 
+                        id,
+                        content,
+                        metadata,
+                        1 - (embedding <=> $1) as similarity
+                    FROM documents
+                    ORDER BY embedding <=> $1
+                    LIMIT $2
+                ''', query_embedding_list, top_k)
+
+                formatted_results = []
+                for row in results:
+                    formatted_results.append({
+                        "id": str(row["id"]),
+                        "document": row["content"],
+                        "metadata": row["metadata"] or {},
+                        "distance": 1 - float(row["similarity"]),
+                        "score": float(row["similarity"])
+                    })
+
+                logger.debug(f"Найдено {len(formatted_results)} релевантных документов")
+                return formatted_results
+
+        except Exception as e:
+            logger.error(f"Ошибка поиска в PostgreSQL: {e}")
+            return []
+
+    async def get_collection_info(self) -> Dict[str, Any]:
+        """Получение информации о коллекции документов"""
+        try:
+            async with self.pool.acquire() as conn:
+                count = await conn.fetchval("SELECT COUNT(*) FROM documents")
+                return {
+                    "database": "PostgreSQL",
+                    "table_name": "documents",
+                    "document_count": count,
+                    "status": "healthy",
+                    "vector_dimension": self.embedding_dim
                 }
+        except Exception as e:
+            logger.error(f"Ошибка получения информации о коллекции: {e}")
+            return {
+                "database": "PostgreSQL",
+                "table_name": "documents",
+                "document_count": 0,
+                "status": "error",
+                "error": str(e)
             }
 
-            function updateUploadSectionVisibility() {
-                const uploadSection = document.getElementById("uploadSection");
-                if (showUploadSection) {
-                    uploadSection.classList.remove("hidden");
-                } else {
-                    uploadSection.classList.add("hidden");
-                }
-            }
+    async def delete_all_documents(self):
+        """Удаление всех документов (для тестирования)"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("DELETE FROM documents")
+                logger.info("Все документы удалены из PostgreSQL")
+        except Exception as e:
+            logger.error(f"Ошибка удаления документов: {e}")
+            raise
 
-            // Chat management functions
-            function createNewChat() {
-                const chatId = "chat-" + Date.now();
-                const newChat = {
-                    id: chatId,
-                    title: "Новый чат " + (chats.length + 1),
-                    messages: [],
-                    createdAt: new Date().toISOString(),
-                    isActive: true,
-                };
+# Global instance
+vector_store = PGVectorStoreService()
 
-                // Deactivate all other chats
-                chats.forEach((chat) => (chat.isActive = false));
-
-                chats.unshift(newChat);
-                saveChats();
-                renderChatsList();
-                switchChat(chatId);
-
-                // Enable input
-                document.getElementById("message").disabled = false;
-                document.getElementById("sendBtn").disabled = false;
-            }
-
-            function switchChat(chatId) {
-                // Deactivate all chats
-                chats.forEach((chat) => (chat.isActive = false));
-
-                // Activate selected chat
-                const selectedChat = chats.find((chat) => chat.id === chatId);
-                if (selectedChat) {
-                    selectedChat.isActive = true;
-                    currentChatId = chatId;
-                    renderChatMessages(selectedChat.messages);
-                    updateChatTitle(chatId, selectedChat.title);
-                }
-
-                saveChats();
-                renderChatsList();
-            }
-
-            function deleteChat(chatId, event) {
-                event.stopPropagation();
-
-                if (confirm("Вы уверены, что хотите удалить этот чат?")) {
-                    chats = chats.filter((chat) => chat.id !== chatId);
-
-                    if (currentChatId === chatId) {
-                        currentChatId = null;
-                        document.getElementById("chat").innerHTML =
-                            '<div class="message system">Выберите чат или создайте новый</div>';
-                        document.getElementById("message").disabled = true;
-                        document.getElementById("sendBtn").disabled = true;
-                    }
-
-                    saveChats();
-                    renderChatsList();
-                }
-            }
-
-            function editChatTitle(chatId, event) {
-                event.stopPropagation();
-
-                const chatItem = event.target.closest(".chat-item");
-                const titleElement = chatItem.querySelector(".chat-title");
-                const currentTitle = titleElement.textContent;
-
-                const input = document.createElement("input");
-                input.type = "text";
-                input.className = "chat-title-input";
-                input.value = currentTitle;
-
-                titleElement.replaceWith(input);
-                input.focus();
-                input.select();
-
-                function saveTitle() {
-                    const newTitle = input.value.trim() || currentTitle;
-                    updateChatTitle(chatId, newTitle);
-                    renderChatsList();
-                }
-
-                input.addEventListener("blur", saveTitle);
-                input.addEventListener("keypress", function (e) {
-                    if (e.key === "Enter") {
-                        saveTitle();
-                    }
-                });
-            }
-
-            function updateChatTitle(chatId, newTitle) {
-                const chat = chats.find((chat) => chat.id === chatId);
-                if (chat) {
-                    chat.title = newTitle;
-                    saveChats();
-                }
-            }
-
-            // Rendering functions
-            function renderChatsList() {
-                const chatsList = document.getElementById("chatsList");
-                chatsList.innerHTML = "";
-
-                if (chats.length === 0) {
-                    chatsList.innerHTML =
-                        '<div style="padding: 15px; color: #666; text-align: center;">Нет сохраненных чатов</div>';
-                    return;
-                }
-
-                chats.forEach((chat) => {
-                    const chatItem = document.createElement("div");
-                    chatItem.className = `chat-item ${chat.isActive ? "active" : ""}`;
-                    chatItem.onclick = () => switchChat(chat.id);
-
-                    chatItem.innerHTML = `
-                    <div class="chat-title">${escapeHtml(chat.title)}</div>
-                    <div class="chat-actions">
-                        <button class="delete-chat" onclick="deleteChat('${chat.id}', event)">×</button>
-                    </div>
-                `;
-
-                    // Double click to edit title
-                    chatItem.ondblclick = (e) => editChatTitle(chat.id, e);
-
-                    chatsList.appendChild(chatItem);
-                });
-            }
-
-            function renderChatMessages(messages) {
-                const chatContainer = document.getElementById("chat");
-                chatContainer.innerHTML = "";
-
-                if (messages.length === 0) {
-                    chatContainer.innerHTML =
-                        '<div class="message system">Задайте ваш первый вопрос</div>';
-                    return;
-                }
-
-                messages.forEach((msg) => {
-                    addMessage(msg.role, msg.content, false, false);
-                });
-            }
-
-            function addMessage(role, content, isTyping = false, saveToHistory = true) {
-                const chatContainer = document.getElementById("chat");
-                const messageDiv = document.createElement("div");
-                messageDiv.className = `message ${role}`;
-
-                if (isTyping) {
-                    messageDiv.innerHTML = `
-                    <strong>Ассистент:</strong>
-                    <span class="typing-indicator">
-                        Обработка запроса
-                        <span class="typing-dots">
-                            <span>.</span><span>.</span><span>.</span>
-                        </span>
-                    </span>
-                `;
-                } else {
-                    const roleNames = {
-                        user: "Вы",
-                        assistant: "Ассистент",
-                        system: "Система",
-                        error: "Ошибка",
-                    };
-
-                    messageDiv.innerHTML = `<strong>${roleNames[role]}:</strong> ${escapeHtml(content)}`;
-                }
-
-                chatContainer.appendChild(messageDiv);
-                chatContainer.scrollTop = chatContainer.scrollHeight;
-
-                // Save to current chat history
-                if (saveToHistory && currentChatId && !isTyping) {
-                    const currentChat = chats.find((chat) => chat.id === currentChatId);
-                    if (currentChat) {
-                        currentChat.messages.push({
-                            role,
-                            content,
-                            timestamp: new Date().toISOString(),
-                        });
-                        saveChats();
-                    }
-                }
-
-                return messageDiv;
-            }
-
-            // Message sending
-            async function sendMessage() {
-                const messageInput = document.getElementById("message");
-                const sendBtn = document.getElementById("sendBtn");
-                const message = messageInput.value.trim();
-
-                if (!message || !currentChatId) return;
-
-                // Add user message
-                addMessage("user", message);
-                messageInput.value = "";
-                messageInput.disabled = true;
-                sendBtn.disabled = true;
-                sendBtn.textContent = "Отправка...";
-
-                // Show typing indicator
-                const typingIndicator = addMessage("assistant", "", true, false);
-
-                try {
-                    const response = await fetch("/api/v1/chat", {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                        },
-                        body: JSON.stringify({
-                            message: message,
-                            conversation_id: currentChatId,
-                        }),
-                    });
-
-                    // Remove typing indicator
-                    typingIndicator.remove();
-
-                    if (!response.ok) {
-                        throw new Error(`Ошибка HTTP: ${response.status}`);
-                    }
-
-                    const data = await response.json();
-                    addMessage("assistant", data.response);
-
-                    if (data.sources && data.sources.length > 0) {
-                        addMessage(
-                            "system",
-                            `Использованные источники: ${data.sources.join(", ")}`,
-                        );
-                    }
-                } catch (error) {
-                    // Remove typing indicator
-                    typingIndicator.remove();
-                    addMessage("error", `Ошибка соединения: ${error.message}`);
-                } finally {
-                    messageInput.disabled = false;
-                    sendBtn.disabled = false;
-                    sendBtn.textContent = "Отправить";
-                    messageInput.focus();
-                }
-            }
-
-            // File upload
-            async function uploadFile() {
-                const fileInput = document.getElementById("fileInput");
-                const uploadStatus = document.getElementById("uploadStatus");
-                const file = fileInput.files[0];
-
-                if (!file) {
-                    uploadStatus.innerHTML = '<span style="color: #dc3545;">Выберите файл</span>';
-                    return;
-                }
-
-                const formData = new FormData();
-                formData.append("file", file);
-
-                uploadStatus.innerHTML = '<span style="color: #007bff;">Загрузка...</span>';
-
-                try {
-                    const response = await fetch("/api/v1/upload", {
-                        method: "POST",
-                        body: formData,
-                    });
-
-                    const result = await response.json();
-
-                    if (response.ok) {
-                        uploadStatus.innerHTML = `<span style="color: #28a745;">${result.message}</span>`;
-                        fileInput.value = "";
-
-                        // Add system message about successful upload
-                        if (currentChatId) {
-                            addMessage(
-                                "system",
-                                `Файл "${file.name}" успешно загружен и обработан`,
-                            );
-                        }
-                    } else {
-                        uploadStatus.innerHTML = `<span style="color: #dc3545;">Ошибка: ${result.detail || "Неизвестная ошибка"}</span>`;
-                    }
-                } catch (error) {
-                    uploadStatus.innerHTML = `<span style="color: #dc3545;">Ошибка сети: ${error.message}</span>`;
-                }
-            }
-
-            // Utility functions
-            function saveChats() {
-                localStorage.setItem("rag-chats", JSON.stringify(chats));
-            }
-
-            function escapeHtml(unsafe) {
-                return unsafe
-                    .replace(/&/g, "&amp;")
-                    .replace(/</g, "&lt;")
-                    .replace(/>/g, "&gt;")
-                    .replace(/"/g, "&quot;")
-                    .replace(/'/g, "&#039;");
-            }
-
-            // Set upload section visibility
-            function setUploadSectionVisibility(visible) {
-                showUploadSection = visible;
-                updateUploadSectionVisibility();
-            }
-        </script>
-    </body>
-</html>
