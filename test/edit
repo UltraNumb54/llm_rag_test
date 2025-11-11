@@ -1,249 +1,6 @@
-# app/services/vllm_manager.py
-import subprocess
-import time
-import requests
-import threading
-from loguru import logger
-from app.config import settings
-
-class VLLMManager:
-    def __init__(self):
-        self.process = None
-        self.is_running = False
-
-    def start_vllm_server(self):
-        """Запускает vLLM сервер в отдельном процессе"""
-        try:
-            # Команда для запуска vLLM
-            cmd = [
-                "vllm", "serve",
-                settings.VLLM_MODEL_NAME,
-                "--host", "0.0.0.0",
-                "--port", "8080",  # Используем порт 8080 для vLLM
-                "--dtype", "half",
-                "--gpu-memory-utilization", "0.8"
-            ]
-            
-            logger.info(f"Запуск vLLM сервера: {' '.join(cmd)}")
-            
-            # Запускаем процесс
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            # Запускаем мониторинг вывода в отдельном потоке
-            threading.Thread(target=self._monitor_output, daemon=True).start()
-            
-            # Ждем запуска сервера
-            if self._wait_for_server():
-                self.is_running = True
-                logger.success("vLLM сервер успешно запущен")
-                return True
-            else:
-                logger.error("Не удалось запустить vLLM сервер")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Ошибка при запуске vLLM: {e}")
-            return False
-
-    def _monitor_output(self):
-        """Мониторинг вывода vLLM сервера"""
-        while self.process and self.process.poll() is None:
-            output = self.process.stdout.readline()
-            if output:
-                logger.info(f"vLLM: {output.strip()}")
-
-    def _wait_for_server(self, timeout=60):
-        """Ожидает пока vLLM сервер станет доступен"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{settings.VLLM_BASE_URL}/models", timeout=5)
-                if response.status_code == 200:
-                    return True
-            except:
-                pass
-            time.sleep(2)
-        return False
-
-    def stop_vllm_server(self):
-        """Останавливает vLLM сервер"""
-        if self.process:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-            self.is_running = False
-            logger.info("vLLM сервер остановлен")
-
-# Глобальный экземпляр
-vllm_manager = VLLMManager()
-
-
-# Обновление пакетов
-sudo apt update
-
-# Установка PostgreSQL
-sudo apt install postgresql postgresql-contrib
-
-# Запуск службы
-sudo service postgresql start
-
-# Включение автозапуска
-sudo systemctl enable postgresql
-
-# Установка зависимостей для сборки
-sudo apt install build-essential postgresql-server-dev-14
-
-# Скачивание и установка pgvector
-cd /tmp
-git clone https://github.com/pgvector/pgvector.git
-cd pgvector
-make
-sudo make install
-
-# Подключение к PostgreSQL и создание расширения
-sudo -u postgres psql
-
-CREATE EXTENSION vector;
-\q
-
-# Создание пользователя и базы данных
-sudo -u postgres createuser -P -s rag_user  # Задайте пароль
-sudo -u postgres createdb -O rag_user rag_db
-
-psycopg2-binary==2.9.10
-pgvector==0.2.6
-sqlalchemy==2.0.38
-asyncpg==0.29.0
-
-pip install psycopg2-binary pgvector sqlalchemy asyncpg
-
-# app/core/postgres_db.py
-import asyncpg
-from sqlalchemy import create_engine, Column, Integer, String, Text, JSON
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from pgvector.sqlalchemy import Vector
-from app.config import settings
-from loguru import logger
-import numpy as np
-
-Base = declarative_base()
-
-class DocumentModel(Base):
-    __tablename__ = "documents"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    content = Column(Text, nullable=False)
-    embedding = Column(Vector(384))  # Для модели MiniLM-L12-v2
-    metadata = Column(JSON)
-    document_id = Column(String, unique=True, index=True)
-
-class PostgreSQLManager:
-    def __init__(self):
-        self.engine = None
-        self.SessionLocal = None
-        self.async_pool = None
-
-    def init_sync_connection(self):
-        """Инициализация синхронного подключения для SQLAlchemy"""
-        try:
-            # Формат: postgresql://user:password@localhost:5432/dbname
-            sync_database_url = f"postgresql://{settings.DB_USER}:{settings.DB_PASSWORD}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
-            
-            self.engine = create_engine(sync_database_url)
-            self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
-            
-            # Создаем таблицы
-            Base.metadata.create_all(bind=self.engine)
-            logger.success("PostgreSQL подключен синхронно")
-            
-        except Exception as e:
-            logger.error(f"Ошибка подключения к PostgreSQL: {e}")
-            raise
-
-    async def init_async_connection(self):
-        """Инициализация асинхронного подключения"""
-        try:
-            self.async_pool = await asyncpg.create_pool(
-                user=settings.DB_USER,
-                password=settings.DB_PASSWORD,
-                database=settings.DB_NAME,
-                host=settings.DB_HOST,
-                port=settings.DB_PORT
-            )
-            logger.success("PostgreSQL подключен асинхронно")
-        except Exception as e:
-            logger.error(f"Ошибка асинхронного подключения к PostgreSQL: {e}")
-            raise
-
-    def get_session(self):
-        """Получение синхронной сессии"""
-        if not self.SessionLocal:
-            self.init_sync_connection()
-        return self.SessionLocal()
-
-    async def get_async_connection(self):
-        """Получение асинхронного подключения"""
-        if not self.async_pool:
-            await self.init_async_connection()
-        return self.async_pool
-
-    async def search_similar(self, embedding: list, limit: int = 5):
-        """Поиск похожих документов"""
-        conn = await self.get_async_connection()
-        embedding_array = np.array(embedding)
-        
-        try:
-            # Используем cosine расстояние
-            results = await conn.fetch("""
-                SELECT content, metadata, document_id,
-                       embedding <=> $1 as distance
-                FROM documents 
-                ORDER BY embedding <=> $1
-                LIMIT $2
-            """, embedding_array, limit)
-            
-            return [
-                {
-                    "document": row["content"],
-                    "metadata": row["metadata"],
-                    "document_id": row["document_id"],
-                    "distance": row["distance"]
-                }
-                for row in results
-            ]
-        except Exception as e:
-            logger.error(f"Ошибка поиска: {e}")
-            return []
-
-    async def add_document(self, content: str, embedding: list, metadata: dict = None, document_id: str = None):
-        """Добавление документа в базу"""
-        conn = await self.get_async_connection()
-        embedding_array = np.array(embedding)
-        
-        try:
-            await conn.execute("""
-                INSERT INTO documents (content, embedding, metadata, document_id)
-                VALUES ($1, $2, $3, $4)
-            """, content, embedding_array, metadata or {}, document_id)
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка добавления документа: {e}")
-            return False
-
-# Глобальный экземпляр
-postgres_manager = PostgreSQLManager()
-
-# app/config.py
+1. Обновленный app/config.py
 from typing import List, Optional
-from pydantic import Field
+from pydantic import Field, validator
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -251,110 +8,735 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
-    # Модели
+    # Модели для embedding и реранкера
     EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    
-    # vLLM настройки
-    VLLM_BASE_URL: str = "http://localhost:8080/v1"
+
+    # Настройки vLLM
+    VLLM_BASE_URL: str = "http://localhost:8000/v1"
     VLLM_API_KEY: str = "none"
     VLLM_MODEL_NAME: str = "Qwen/Qwen2.5-7B-Instruct-AWQ"
 
-    # PostgreSQL настройки (заменяем ChromaDB)
-    DB_HOST: str = "localhost"
-    DB_PORT: int = 5432
-    DB_NAME: str = "rag_db"
-    DB_USER: str = "rag_user"
-    DB_PASSWORD: str = "your_password_here"  # Задайте пароль
-
-    # Остальные настройки
-    COLLECTION_NAME: str = "tech_support_docs"
+    # Настройки PostgreSQL
+    DATABASE_URL: str = "postgresql://rag_user:password@localhost:5432/rag_db"
+    
+    # Настройки обработки документов
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
-    MAX_FILE_SIZE: int = 100 * 1024 * 1024
+    MAX_FILE_SIZE: int = 100 * 1024 * 1024  # 100MB
+
+    # Настройки поиска
     TOP_K: int = 3
     RERANK_TOP_K: int = 2
     MAX_CONCURRENT_REQUESTS: int = 10
+
+    # Безопасность
     API_KEY: Optional[str] = None
     CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
 
+    @validator("DATABASE_URL")
+    def validate_database_url(cls, v):
+        if not v.startswith("postgresql://"):
+            raise ValueError("DATABASE_URL must start with postgresql://")
+        return v
+
     class Config:
         env_file = ".env"
+        case_sensitive = False
 
 settings = Settings()
 
-# app/services/vector_store.py
-from app.core.postgres_db import postgres_manager
-from app.services.embedding import get_embedding
+2. Обновленный app/core/database.py
+import asyncpg
+import numpy as np
+from app.config import settings
 from loguru import logger
 
-class VectorStore:
-    def __init__(self):
-        self.embedding_model = get_embedding
+class DatabaseManager:
+    _pool = None
 
-    async def search(self, query: str, top_k: int = 5):
-        """Поиск похожих документов"""
-        try:
-            # Получаем эмбеддинг запроса
-            query_embedding = await self.embedding_model.embed_query(query)
+    @classmethod
+    async def get_pool(cls):
+        if cls._pool is None:
+            try:
+                cls._pool = await asyncpg.create_pool(
+                    settings.DATABASE_URL,
+                    min_size=5,
+                    max_size=20,
+                    command_timeout=60
+                )
+                logger.info("PostgreSQL connection pool created successfully")
+                
+                # Initialize database schema
+                await cls._init_schema()
+                
+            except Exception as e:
+                logger.error(f"Failed to create database connection pool: {e}")
+                raise
+        return cls._pool
+
+    @classmethod
+    async def _init_schema(cls):
+        """Initialize database tables and indexes"""
+        pool = await cls.get_pool()
+        async with pool.acquire() as conn:
+            # Enable vector extension
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             
-            # Ищем в PostgreSQL
-            results = await postgres_manager.search_similar(query_embedding, limit=top_k)
+            # Create documents table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS documents (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    content TEXT NOT NULL,
+                    embedding VECTOR(384), -- размерность для multilingual-MiniLM-L12-v2
+                    metadata JSONB DEFAULT '{}',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            ''')
             
-            logger.info(f"Найдено документов: {len(results)}")
-            return results
+            # Create index for vector search
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS documents_embedding_idx 
+                ON documents USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100);
+            ''')
             
-        except Exception as e:
-            logger.error(f"Ошибка поиска в векторной базе: {e}")
+            # Create metadata index
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS documents_metadata_idx 
+                ON documents USING gin (metadata);
+            ''')
+            
+            logger.info("Database schema initialized successfully")
+
+    @classmethod
+    async def close_pool(cls):
+        if cls._pool:
+            await cls._pool.close()
+            cls._pool = None
+            logger.info("Database connection pool closed")
+
+# Utility functions
+async def get_database_pool():
+    return await DatabaseManager.get_pool()
+
+async def init_database():
+    await DatabaseManager.get_pool()
+
+async def close_database():
+    await DatabaseManager.close_pool()
+
+3. Новый app/services/vector_store.py с PostgreSQL
+import uuid
+from typing import Any, Dict, List, Optional
+import numpy as np
+
+from app.config import settings
+from app.core.database import get_database_pool
+from app.services.embedding import embedding_service
+from loguru import logger
+
+class PGVectorStoreService:
+    def __init__(self):
+        self.embedding_dim = 384  # Размерность для multilingual-MiniLM-L12-v2
+        self.pool = None
+
+    async def init(self):
+        """Initialize connection pool"""
+        self.pool = await get_database_pool()
+
+    async def add_documents(
+        self, documents: List[str], metadatas: List[Dict[str, Any]] = None
+    ) -> List[str]:
+        """Добавление документов в векторное хранилище PostgreSQL"""
+        if not documents:
+            logger.warning("Попытка добавить пустой список документов")
             return []
 
-    async def add_documents(self, documents: list, metadatas: list = None):
-        """Добавление документов в базу"""
         if metadatas is None:
             metadatas = [{}] * len(documents)
+        elif len(metadatas) != len(documents):
+            logger.warning("Количество метаданных не совпадает с количеством документов")
+            metadatas = [{}] * len(documents)
 
-        success_count = 0
-        for i, (doc, meta) in enumerate(zip(documents, metadatas)):
-            try:
-                # Получаем эмбеддинг документа
-                embedding = await self.embedding_model.embed_query(doc)
-                
-                # Добавляем в PostgreSQL
-                document_id = f"doc_{i}_{hash(doc)}"
-                success = await postgres_manager.add_document(
-                    content=doc,
-                    embedding=embedding,
-                    metadata=meta,
-                    document_id=document_id
-                )
-                
-                if success:
-                    success_count += 1
+        try:
+            # Создаем эмбеддинги
+            logger.info(f"Создание эмбеддингов для {len(documents)} документов...")
+            embeddings = embedding_service.encode(documents)
+
+            ids = []
+            async with self.pool.acquire() as conn:
+                for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
+                    doc_id = str(uuid.uuid4())
+                    # Convert embedding to PostgreSQL vector format
+                    embedding_vector = f"[{','.join(map(str, embedding))}]"
                     
-            except Exception as e:
-                logger.error(f"Ошибка добавления документа {i}: {e}")
+                    await conn.execute('''
+                        INSERT INTO documents (id, content, embedding, metadata)
+                        VALUES ($1, $2, $3::vector, $4)
+                    ''', doc_id, doc, embedding_vector, metadata)
+                    
+                    ids.append(doc_id)
 
-        logger.info(f"Успешно добавлено {success_count}/{len(documents)} документов")
-        return success_count
+            logger.success(f"Добавлено {len(documents)} документов в PostgreSQL")
+            return ids
 
-# Глобальный экземпляр
-vector_store = VectorStore()
+        except Exception as e:
+            logger.error(f"Ошибка добавления документов в PostgreSQL: {e}")
+            raise
 
-# В начале файла
-from app.core.postgres_db import postgres_manager
+    async def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Поиск похожих документов в PostgreSQL"""
+        if top_k is None:
+            top_k = settings.TOP_K
 
-# В lifespan замените
+        try:
+            # Создаем эмбеддинг для запроса
+            query_embedding = embedding_service.encode(query)
+            query_vector = f"[{','.join(map(str, query_embedding))}]"
+
+            async with self.pool.acquire() as conn:
+                # Используем косинусное расстояние
+                results = await conn.fetch('''
+                    SELECT 
+                        id,
+                        content,
+                        metadata,
+                        1 - (embedding <=> $1::vector) as similarity
+                    FROM documents
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT $2
+                ''', query_vector, top_k)
+
+                formatted_results = []
+                for row in results:
+                    formatted_results.append({
+                        "id": row["id"],
+                        "document": row["content"],
+                        "metadata": row["metadata"] or {},
+                        "distance": 1 - float(row["similarity"]),
+                        "score": float(row["similarity"])
+                    })
+
+                logger.debug(f"Найдено {len(formatted_results)} релевантных документов")
+                return formatted_results
+
+        except Exception as e:
+            logger.error(f"Ошибка поиска в PostgreSQL: {e}")
+            return []
+
+    async def get_collection_info(self) -> Dict[str, Any]:
+        """Получение информации о коллекции документов"""
+        try:
+            async with self.pool.acquire() as conn:
+                count = await conn.fetchval("SELECT COUNT(*) FROM documents")
+                return {
+                    "database": "PostgreSQL",
+                    "table_name": "documents",
+                    "document_count": count,
+                    "status": "healthy",
+                    "vector_dimension": self.embedding_dim
+                }
+        except Exception as e:
+            logger.error(f"Ошибка получения информации о коллекции: {e}")
+            return {
+                "database": "PostgreSQL",
+                "table_name": "documents",
+                "document_count": 0,
+                "status": "error",
+                "error": str(e)
+            }
+
+    async def delete_all_documents(self):
+        """Удаление всех документов (для тестирования)"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("DELETE FROM documents")
+                logger.info("Все документы удалены из PostgreSQL")
+        except Exception as e:
+            logger.error(f"Ошибка удаления документов: {e}")
+            raise
+
+# Global instance
+vector_store = PGVectorStoreService()
+4. Обновленный app/main.py
+import os
+import sys
+import uvicorn
+import asyncio
+from contextlib import asynccontextmanager
+
+from app.config import settings
+from app.core.database import init_database, close_database
+from app.services.vector_store import vector_store
+from app.services.vllm_manager import vllm_manager, cleanup_all_vllm_processes
+from app.utils.logger import setup_logger
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+# Import routers
+from app.routers import health, chat, files
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Запуск RAG системы с PostgreSQL и vLLM...")
+    await init_database()
+    await vector_store.init()
+    
+    # Запускаем vLLM сервер
+    print("Инициализация vLLM сервера...")
+    if not vllm_manager.start_vllm_server():
+        print("Не удалось запустить vLLM сервер. Приложение будет остановлено.")
+        raise RuntimeError("VLLM server failed to start")
+    
+    yield
+    
+    # Shutdown
+    vllm_manager.stop_vllm_server()
+    cleanup_all_vllm_processes()
+    await close_database()
 
-    # Инициализация PostgreSQL
+app = FastAPI(
+    title="RAG System with vLLM",
+    description="Система RAG с vLLM и PostgreSQL для технической поддержки",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Include routers
+app.include_router(health.router, prefix="/api/v1", tags=["health"])
+app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
+app.include_router(files.router, prefix="/api/v1", tags=["files"])
+
+@app.get("/")
+async def root():
+    return {"message": "RAG System with vLLM and PostgreSQL", "status": "running"}
+
+@app.get("/api/v1")
+async def api_info():
+    return {
+        "name": "RAG API",
+        "version": "1.0.0",
+        "models": {
+            "llm": settings.VLLM_MODEL_NAME,
+            "embedding": settings.EMBEDDING_MODEL,
+            "reranker": settings.RERANKER_MODEL
+        }
+    }
+
+def setup_environment():
+    """Настройка окружения"""
+    os.makedirs("uploads", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("static", exist_ok=True)
+
+def print_startup_info():
+    """Выводит информацию о запуске"""
+    print("\n" + "="*60)
+    print("🚀 Запуск RAG системы с vLLM и PostgreSQL")
+    print("="*60)
+    print("Конфигурация:")
+    print(f"- Веб-интерфейс: http://{settings.HOST}:{settings.PORT}")
+    print(f"- API: http://{settings.HOST}:{settings.PORT}/api/v1")
+    print(f"- vLLM сервер: {settings.VLLM_BASE_URL}")
+    print(f"- Модель: {settings.VLLM_MODEL_NAME}")
+    print(f"- База данных: PostgreSQL с pgvector")
+    print(f"- Документация: http://{settings.HOST}:{settings.PORT}/docs")
+    print()
+    print("Доступные endpoints:")
+    print("GET  /                   - Информация о API")
+    print("   POST /api/v1/upload      - Загрузка файлов")
+    print("   POST /api/v1/chat        - Чат с RAG")
+    print("   GET  /api/v1/health      - Статус системы")
+    print("="*60)
+    print()
+
+def main():
+    """Основная функция запуска"""
+    setup_environment()
+    setup_logger()
+    
+    print_startup_info()
+
     try:
-        postgres_manager.init_sync_connection()
-        await postgres_manager.init_async_connection()
-        logger.success("PostgreSQL подключен успешно")
+        uvicorn.run(
+            "app.main:app",
+            host=settings.HOST,
+            port=settings.PORT,
+            reload=True,
+            log_level="info",
+            access_log=True,
+        )
+    except KeyboardInterrupt:
+        print("\nПолучен сигнал прерывания...")
     except Exception as e:
-        logger.error(f"Ошибка подключения к PostgreSQL: {e}")
+        print(f"\nНеожиданная ошибка: {e}")
+    finally:
+        print("Приложение завершено")
 
-    # Остальной код...
+if __name__ == "__main__":
+    main()
+5. Обновленный app/routers/health.py
+python
+import os
+import psutil
+import asyncpg
+from app.config import settings
+from app.core.database import get_database_pool
+from app.services.llm_service import llm_service
+from fastapi import APIRouter, HTTPException
+from loguru import logger
+
+router = APIRouter()
+
+@router.get("/health")
+async def health_check():
+    """Проверка здоровья всех компонентов системы"""
+    checks = {}
+
+    # Проверка PostgreSQL
+    try:
+        pool = await get_database_pool()
+        async with pool.acquire() as conn:
+            # Проверяем подключение и расширение vector
+            await conn.fetchval("SELECT 1")
+            vector_ext = await conn.fetchval(
+                "SELECT installed_version FROM pg_available_extensions WHERE name = 'vector'"
+            )
+            checks["postgresql"] = {
+                "status": "healthy", 
+                "message": "Connected with vector extension",
+                "vector_version": vector_ext
+            }
+    except Exception as e:
+        checks["postgresql"] = {"status": "unhealthy", "message": str(e)}
+
+    # Проверка vLLM
+    try:
+        test_response = llm_service.generate("Ответь 'OK'", max_tokens=5)
+        checks["vllm"] = {
+            "status": "healthy",
+            "message": "Connected",
+            "test_response": test_response.strip() if test_response else "No response"
+        }
+    except Exception as e:
+        checks["vllm"] = {"status": "unhealthy", "message": str(e)}
+
+    # Проверка памяти
+    memory = psutil.virtual_memory()
+    checks["memory"] = {
+        "total_gb": round(memory.total / (1024**3), 2),
+        "available_gb": round(memory.available / (1024**3), 2),
+        "used_percent": memory.percent,
+    }
+
+    # Проверка диска
+    disk = psutil.disk_usage("/")
+    checks["disk"] = {
+        "total_gb": round(disk.total / (1024**3), 2),
+        "free_gb": round(disk.free / (1024**3), 2),
+        "used_percent": disk.percent,
+    }
+
+    # Общий статус
+    critical_services_healthy = all(
+        checks[service]["status"] == "healthy" for service in ["postgresql", "vllm"]
+    )
+
+    overall_status = "healthy" if critical_services_healthy else "degraded"
+
+    return {
+        "status": overall_status, 
+        "version": "1.0.0", 
+        "checks": checks
+    }
+6. Обновленный app/routers/chat.py
+python
+from typing import List, Optional
+from app.config import settings
+from app.services.llm_service import llm_service
+from app.services.reranker import reranker_service
+from app.services.vector_store import vector_store
+from fastapi import APIRouter, HTTPException
+from loguru import logger
+from pydantic import BaseModel, Field
+
+router = APIRouter()
+
+# Временное хранилище для истории диалогов
+conversation_store = {}
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+    use_reranking: bool = True
+
+class ChatResponse(BaseModel):
+    response: str = Field(default="")
+    conversation_id: str = Field(default="default")
+    sources: List[str] = Field(default_factory=list)
+    suggested_questions: List[str] = Field(default_factory=list)
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    try:
+        logger.info(f"Получен запрос чата: {request.message}")
+
+        # Создаем или получаем ID диалога
+        conversation_id = request.conversation_id or f"conv_{len(conversation_store) + 1}"
+
+        # Получаем историю диалога
+        history = conversation_store.get(conversation_id, [])
+
+        # Ищем релевантные документы
+        search_results = await vector_store.search(request.message, top_k=settings.TOP_K)
+        logger.info(f"Найдено документов: {len(search_results)}")
+
+        response_text = ""
+        sources = []
+
+        if not search_results:
+            response_text = (
+                "Извините, в моей базе знаний нет информации для ответа на этот вопрос."
+            )
+            logger.info("Документы не найдены, используем стандартный ответ")
+        else:
+            # Извлекаем тексты документов
+            documents = [result["document"] for result in search_results]
+            logger.info(f"Первый документ: {documents[0][:100]}..." if documents else "Нет документов")
+
+            # Реранкинг если включен
+            if request.use_reranking and len(documents) > 1:
+                logger.info("Применяем реранкинг документов")
+                reranked_docs = reranker_service.rerank(
+                    request.message, documents, top_k=settings.RERANK_TOP_K
+                )
+                context_docs = [doc for doc, score in reranked_docs]
+            else:
+                context_docs = documents[: settings.RERANK_TOP_K]
+
+            # Генерация ответа с контекстом
+            logger.info("Генерация ответа с контекстом...")
+            response_text = llm_service.generate_with_context(
+                question=request.message,
+                context=context_docs,
+                conversation_history=history,
+            )
+
+            # Проверяем что ответ не пустой
+            if not response_text or response_text.strip() == "":
+                response_text = "Не удалось получить ответ от модели. Пожалуйста, попробуйте еще раз."
+                logger.warning("Получен пустой ответ от модели")
+
+            sources = [result["document"][:100] + "..." for result in search_results[:3]]
+
+        # Обновляем историю диалога
+        history.extend([
+            {"role": "user", "content": request.message},
+            {"role": "assistant", "content": response_text},
+        ])
+
+        # Ограничиваем историю последними 10 сообщениями
+        conversation_store[conversation_id] = history[-10:]
+
+        # Предлагаемые вопросы
+        suggested_questions = [
+            "Какие документы можно загружать?",
+            "Как работает поиск?",
+            "Какие форматы файлов поддерживаются?",
+        ]
+
+        logger.info(f"Успешно сгенерирован ответ длиной {len(response_text)} символов")
+
+        return ChatResponse(
+            response=response_text,
+            conversation_id=conversation_id,
+            sources=sources,
+            suggested_questions=suggested_questions,
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка в чате: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка обработки запроса: {str(e)}")
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """Получить историю диалога"""
+    history = conversation_store.get(conversation_id, [])
+    return {"conversation_id": conversation_id, "history": history}
+7. Создайте файл app/routers/files.py
+python
+import os
+import aiofiles
+from typing import List
+from fastapi import APIRouter, UploadFile, File, HTTPException
+from app.services.file_processor import file_processor
+from app.services.vector_store import vector_store
+from loguru import logger
+
+router = APIRouter()
+
+@router.post("/upload")
+async def upload_files(files: List[UploadFile] = File(...)):
+    """Загрузка и обработка файлов"""
+    uploaded_files = []
+    processed_documents = []
+    
+    for file in files:
+        try:
+            # Проверяем размер файла
+            file.file.seek(0, 2)  # Переходим в конец файла
+            file_size = file.file.tell()
+            file.file.seek(0)  # Возвращаемся в начало
+            
+            if file_size > 100 * 1024 * 1024:  # 100MB
+                raise HTTPException(status_code=400, detail=f"Файл {file.filename} слишком большой")
+            
+            # Сохраняем файл
+            file_path = f"uploads/{file.filename}"
+            async with aiofiles.open(file_path, 'wb') as f:
+                content = await file.read()
+                await f.write(content)
+            
+            # Обрабатываем файл
+            documents = await file_processor.process_file(file_path)
+            processed_documents.extend(documents)
+            
+            uploaded_files.append({
+                "filename": file.filename,
+                "size": file_size,
+                "document_count": len(documents)
+            })
+            
+            logger.info(f"Файл {file.filename} обработан, извлечено {len(documents)} документов")
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки файла {file.filename}: {e}")
+            raise HTTPException(status_code=500, detail=f"Ошибка обработки файла {file.filename}: {str(e)}")
+    
+    # Добавляем документы в векторное хранилище
+    if processed_documents:
+        document_ids = await vector_store.add_documents(processed_documents)
+        logger.info(f"Добавлено {len(document_ids)} документов в векторное хранилище")
+    
+    return {
+        "message": f"Успешно обработано {len(uploaded_files)} файлов",
+        "uploaded_files": uploaded_files,
+        "total_documents": len(processed_documents)
+    }
+
+@router.get("/files")
+async def list_uploaded_files():
+    """Список загруженных файлов"""
+    try:
+        files = []
+        if os.path.exists("uploads"):
+            for filename in os.listdir("uploads"):
+                file_path = os.path.join("uploads", filename)
+                if os.path.isfile(file_path):
+                    files.append({
+                        "filename": filename,
+                        "size": os.path.getsize(file_path),
+                        "modified": os.path.getmtime(file_path)
+                    })
+        return {"files": files}
+    except Exception as e:
+        logger.error(f"Ошибка получения списка файлов: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения списка файлов")
+8. Обновленный requirements.txt
+txt
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+loguru==0.7.2
+asyncpg==0.29.0
+sentence-transformers==2.2.2
+transformers==4.35.2
+torch==2.1.2
+numpy==1.24.3
+psutil==5.9.6
+python-multipart==0.0.6
+python-dotenv==1.0.0
+aiofiles==23.2.1
+requests==2.31.0
+chromadb==0.4.22
+openai==1.3.9
+
+9. Создайте скрипт инициализации БД scripts/init_database.py
+python
+#!/usr/bin/env python3
+import asyncio
+import asyncpg
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.config import settings
+
+async def init_database():
+    """Инициализация базы данных и пользователя"""
+    try:
+        # Подключаемся к базе данных postgres для создания нашей БД
+        conn = await asyncpg.connect(
+            database="postgres",
+            user="postgres",
+            password="your_password_here",  # замените на ваш пароль
+            host="localhost"
+        )
+        
+        # Создаем базу данных и пользователя
+        await conn.execute("""
+            CREATE USER rag_user WITH PASSWORD 'secure_password';
+            CREATE DATABASE rag_db OWNER rag_user;
+            GRANT ALL PRIVILEGES ON DATABASE rag_db TO rag_user;
+        """)
+        
+        await conn.close()
+        
+        # Теперь подключаемся к новой базе данных для настройки расширений
+        conn = await asyncpg.connect(settings.DATABASE_URL)
+        
+        # Включаем расширение vector
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        
+        print("База данных успешно инициализирована")
+        print(f"   URL: {settings.DATABASE_URL}")
+        
+        await conn.close()
+        
+    except Exception as e:
+        print(f"Ошибка инициализации базы данных: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(init_database())
+
+Дополнительные команды для настройки
+# Дайте права на выполнение скрипта
+chmod +x scripts/init_database.py
+
+# Создайте пользователя и базу данных (если еще не создали)
+sudo -u postgres createuser --createdb --createrole --superuser rag_user
+sudo -u postgres createdb -O rag_user rag_db
+
+# Или используйте интерактивный режим psql
+sudo -u postgres psql -c "CREATE USER rag_user WITH PASSWORD 'secure_password';"
+sudo -u postgres psql -c "CREATE DATABASE rag_db OWNER rag_user;"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE rag_db TO rag_user;"
+
