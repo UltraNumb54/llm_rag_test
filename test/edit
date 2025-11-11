@@ -1,13 +1,10 @@
-🔐 Настройка пароля для пользователя PostgreSQL
 bash
 # Установите пароль для пользователя rag_user
 sudo -u postgres psql -c "ALTER USER rag_user WITH PASSWORD 'secure_password';"
 
 # Проверьте подключение с паролем
 psql -h localhost -U rag_user -d rag_db -W
-📦 Дополнительные зависимости PostgreSQL
-Добавьте в requirements.txt:
-
+requirements.txt:
 txt
 # Добавьте эти строки к существующим зависимостям
 psycopg2-binary==2.9.7
@@ -17,8 +14,7 @@ alembic==1.12.1
 
 bash
 pip install psycopg2-binary sqlalchemy alembic
-🔧 Разделение main.py и start_server.py
-app/main.py (только определение FastAPI приложения)
+app/main.py
 python
 import os
 from contextlib import asynccontextmanager
