@@ -1,217 +1,395 @@
-import asyncpg
+files
+import os
+import asyncio
+import aiofiles
 from app.config import settings
+from app.services.file_processor import FileProcessor
+from app.services.vector_store import vector_store
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from loguru import logger
 
-class DatabaseManager:
-    _pool = None
+router = APIRouter()
+file_processor = FileProcessor()
 
-    @classmethod
-    async def get_pool(cls):
-        if cls._pool is None:
-            try:
-                cls._pool = await asyncpg.create_pool(
-                    settings.DATABASE_URL,
-                    min_size=5,
-                    max_size=20,
-                    command_timeout=60
-                )
-                logger.info("PostgreSQL connection pool created successfully")
-                
-                # Initialize database schema
-                await cls._init_schema()
-                
-            except Exception as e:
-                logger.error(f"Failed to create database connection pool: {e}")
-                raise
-        return cls._pool
-
-    @classmethod
-    async def _init_schema(cls):
-        """Initialize database tables and indexes"""
-        pool = await cls.get_pool()
-        async with pool.acquire() as conn:
-            # Enable vector extension
-            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+async def process_file_background(file_path: str, filename: str):
+    """Асинхронная фоновая обработка файла"""
+    try:
+        logger.info(f"Начата фоновая обработка файла: {filename}")
+        
+        # Обрабатываем файл и получаем документы
+        documents = await file_processor.process_file(file_path, filename)
+        
+        if documents:
+            # Добавляем документы в векторное хранилище
+            await vector_store.add_documents(documents)
+            logger.success(f"Файл {filename} успешно обработан, добавлено {len(documents)} документов")
+        else:
+            logger.warning(f"Файл {filename} не содержит извлекаемого текста")
             
-            # Create documents table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS documents (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    content TEXT NOT NULL,
-                    embedding VECTOR(384),
-                    metadata JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                );
-            ''')
-            
-            # Create index for vector search
-            await conn.execute('''
-                CREATE INDEX IF NOT EXISTS documents_embedding_idx 
-                ON documents USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100);
-            ''')
-            
-            # Create metadata index
-            await conn.execute('''
-                CREATE INDEX IF NOT EXISTS documents_metadata_idx 
-                ON documents USING gin (metadata);
-            ''')
-            
-            logger.info("Database schema initialized successfully")
-
-    @classmethod
-    async def close_pool(cls):
-        if cls._pool:
-            await cls._pool.close()
-            cls._pool = None
-            logger.info("Database connection pool closed")
-
-# Utility functions
-async def get_database_pool():
-    return await DatabaseManager.get_pool()
-
-async def init_database():
-    """Инициализация базы данных - должна быть завершена ДО запуска приложения"""
-    await DatabaseManager.get_pool()
-
-async def close_database():
-    """Закрытие соединений с базой данных"""
-    await DatabaseManager.close_pool()
-
-
-import uuid
-from typing import Any, Dict, List, Optional
-import numpy as np
-
-from app.config import settings
-from app.core.database import get_database_pool
-from app.services.embedding import embedding_service
-from loguru import logger
-
-class PGVectorStoreService:
-    def __init__(self):
-        self.embedding_dim = 384  # Размерность для multilingual-MiniLM-L12-v2
-        self.pool = None
-
-    async def init(self):
-        """Initialize connection pool - должна быть завершена ДО использования"""
-        if self.pool is None:
-            self.pool = await get_database_pool()
-            logger.info("Vector store service initialized")
-
-    async def add_documents(
-        self, documents: List[str], metadatas: List[Dict[str, Any]] = None
-    ) -> List[str]:
-        """Добавление документов в векторное хранилище PostgreSQL"""
-        if not documents:
-            logger.warning("Попытка добавить пустой список документов")
-            return []
-
-        if metadatas is None:
-            metadatas = [{}] * len(documents)
-        elif len(metadatas) != len(documents):
-            logger.warning("Количество метаданных не совпадает с количеством документов")
-            metadatas = [{}] * len(documents)
-
+    except Exception as e:
+        logger.error(f"Ошибка обработки файла {filename}: {e}")
+    finally:
+        # Очищаем временный файл
         try:
-            # Создаем эмбеддинги
-            logger.info(f"Создание эмбеддингов для {len(documents)} документов...")
-            embeddings = embedding_service.encode(documents)
-
-            ids = []
-            async with self.pool.acquire() as conn:
-                for i, (doc, embedding, metadata) in enumerate(zip(documents, embeddings, metadatas)):
-                    doc_id = str(uuid.uuid4())
-                    # Convert embedding to list for PostgreSQL
-                    embedding_list = embedding.tolist() if hasattr(embedding, 'tolist') else embedding
-                    
-                    await conn.execute('''
-                        INSERT INTO documents (id, content, embedding, metadata)
-                        VALUES ($1, $2, $3, $4)
-                    ''', doc_id, doc, embedding_list, metadata)
-                    
-                    ids.append(doc_id)
-
-            logger.success(f"Добавлено {len(documents)} документов в PostgreSQL")
-            return ids
-
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.debug(f"Временный файл {file_path} удален")
         except Exception as e:
-            logger.error(f"Ошибка добавления документов в PostgreSQL: {e}")
-            raise
+            logger.warning(f"Не удалось удалить временный файл {file_path}: {e}")
 
-    async def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Поиск похожих документов в PostgreSQL"""
-        if top_k is None:
-            top_k = settings.TOP_K
+@router.post("/upload")
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    try:
+        # Проверяем размер файла
+        content = await file.read()
+        if len(content) > settings.MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Файл слишком большой. Максимальный размер: {settings.MAX_FILE_SIZE // (1024 * 1024)}MB",
+            )
 
-        try:
-            # Создаем эмбеддинг для запроса
-            query_embedding = embedding_service.encode(query)
-            query_embedding_list = query_embedding.tolist() if hasattr(query_embedding, 'tolist') else query_embedding
+        # Сохраняем файл
+        upload_dir = "uploads"
+        os.makedirs(upload_dir, exist_ok=True)
+        file_path = os.path.join(upload_dir, file.filename)
 
-            async with self.pool.acquire() as conn:
-                # Используем косинусное расстояние
-                results = await conn.fetch('''
-                    SELECT 
-                        id,
-                        content,
-                        metadata,
-                        1 - (embedding <=> $1) as similarity
-                    FROM documents
-                    ORDER BY embedding <=> $1
-                    LIMIT $2
-                ''', query_embedding_list, top_k)
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(content)
 
-                formatted_results = []
-                for row in results:
-                    formatted_results.append({
-                        "id": str(row["id"]),
-                        "document": row["content"],
-                        "metadata": row["metadata"] or {},
-                        "distance": 1 - float(row["similarity"]),
-                        "score": float(row["similarity"])
-                    })
+        # Запускаем фоновую задачу с правильным вызовом
+        background_tasks.add_task(process_file_background, file_path, file.filename)
 
-                logger.debug(f"Найдено {len(formatted_results)} релевантных документов")
-                return formatted_results
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "message": "Файл загружен и отправлен на обработку",
+        }
 
-        except Exception as e:
-            logger.error(f"Ошибка поиска в PostgreSQL: {e}")
-            return []
+    except Exception as e:
+        logger.error(f"Ошибка загрузки файла: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    async def get_collection_info(self) -> Dict[str, Any]:
-        """Получение информации о коллекции документов"""
-        try:
-            async with self.pool.acquire() as conn:
-                count = await conn.fetchval("SELECT COUNT(*) FROM documents")
-                return {
-                    "database": "PostgreSQL",
-                    "table_name": "documents",
-                    "document_count": count,
-                    "status": "healthy",
-                    "vector_dimension": self.embedding_dim
+@router.get("/files")
+async def list_files():
+    """Список загруженных файлов"""
+    try:
+        upload_dir = "uploads"
+        if not os.path.exists(upload_dir):
+            return {"files": []}
+
+        files = []
+        for filename in os.listdir(upload_dir):
+            file_path = os.path.join(upload_dir, filename)
+            stats = os.stat(file_path)
+            files.append(
+                {
+                    "filename": filename,
+                    "size": stats.st_size,
+                    "uploaded_at": stats.st_ctime,
                 }
-        except Exception as e:
-            logger.error(f"Ошибка получения информации о коллекции: {e}")
-            return {
-                "database": "PostgreSQL",
-                "table_name": "documents",
-                "document_count": 0,
-                "status": "error",
-                "error": str(e)
-            }
+            )
 
-    async def delete_all_documents(self):
-        """Удаление всех документов (для тестирования)"""
+        return {"files": files}
+    except Exception as e:
+        logger.error(f"Ошибка получения списка файлов: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+file processor
+
+import os
+import asyncio
+from typing import List
+from loguru import logger
+
+class FileProcessor:
+    async def process_file(self, file_path: str, filename: str) -> List[str]:
+        """Асинхронная обработка файла и извлечение текста"""
         try:
-            async with self.pool.acquire() as conn:
-                await conn.execute("DELETE FROM documents")
-                logger.info("Все документы удалены из PostgreSQL")
+            logger.info(f"Обработка файла: {filename}")
+            
+            # Определяем тип файла по расширению
+            ext = os.path.splitext(filename)[1].lower()
+            
+            if ext == '.txt':
+                return await self._process_txt(file_path)
+            elif ext == '.pdf':
+                return await self._process_pdf(file_path)
+            elif ext in ['.doc', '.docx']:
+                return await self._process_docx(file_path)
+            elif ext == '.md':
+                return await self._process_markdown(file_path)
+            else:
+                logger.warning(f"Неподдерживаемый формат файла: {ext}")
+                return []
+                
         except Exception as e:
-            logger.error(f"Ошибка удаления документов: {e}")
-            raise
+            logger.error(f"Ошибка обработки файла {filename}: {e}")
+            return []
 
-# Global instance
-vector_store = PGVectorStoreService()
+    async def _process_txt(self, file_path: str) -> List[str]:
+        """Обработка текстовых файлов"""
+        try:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                content = await f.read()
+            
+            if not content.strip():
+                return []
+                
+            # Разбиваем на чанки
+            chunks = self._split_text(content)
+            logger.info(f"Текстовый файл обработан, создано {len(chunks)} чанков")
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"Ошибка чтения текстового файла: {e}")
+            return []
 
+    async def _process_pdf(self, file_path: str) -> List[str]:
+        """Обработка PDF файлов"""
+        try:
+            # Для PDF используем синхронную библиотеку, но запускаем в отдельном потоке
+            return await asyncio.get_event_loop().run_in_executor(
+                None, self._process_pdf_sync, file_path
+            )
+        except Exception as e:
+            logger.error(f"Ошибка обработки PDF: {e}")
+            return []
+
+    def _process_pdf_sync(self, file_path: str) -> List[str]:
+        """Синхронная обработка PDF"""
+        try:
+            import PyPDF2
+            
+            chunks = []
+            with open(file_path, 'rb') as f:
+                pdf_reader = PyPDF2.PdfReader(f)
+                
+                for page_num in range(len(pdf_reader.pages)):
+                    page = pdf_reader.pages[page_num]
+                    text = page.extract_text()
+                    
+                    if text.strip():
+                        page_chunks = self._split_text(text)
+                        chunks.extend(page_chunks)
+            
+            logger.info(f"PDF файл обработан, создано {len(chunks)} чанков")
+            return chunks
+            
+        except ImportError:
+            logger.error("PyPDF2 не установлен. Установите: pip install PyPDF2")
+            return []
+        except Exception as e:
+            logger.error(f"Ошибка синхронной обработки PDF: {e}")
+            return []
+
+    async def _process_docx(self, file_path: str) -> List[str]:
+        """Обработка DOCX файлов"""
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, self._process_docx_sync, file_path
+            )
+        except Exception as e:
+            logger.error(f"Ошибка обработки DOCX: {e}")
+            return []
+
+    def _process_docx_sync(self, file_path: str) -> List[str]:
+        """Синхронная обработка DOCX"""
+        try:
+            import docx
+            
+            doc = docx.Document(file_path)
+            full_text = []
+            
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    full_text.append(paragraph.text)
+            
+            text = '\n'.join(full_text)
+            chunks = self._split_text(text)
+            
+            logger.info(f"DOCX файл обработан, создано {len(chunks)} чанков")
+            return chunks
+            
+        except ImportError:
+            logger.error("python-docx не установлен. Установите: pip install python-docx")
+            return []
+        except Exception as e:
+            logger.error(f"Ошибка синхронной обработки DOCX: {e}")
+            return []
+
+    async def _process_markdown(self, file_path: str) -> List[str]:
+        """Обработка Markdown файлов"""
+        try:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                content = await f.read()
+            
+            # Упрощенная обработка Markdown - удаляем разметку
+            import re
+            text = re.sub(r'#+\s?', '', content)  # Удаляем заголовки
+            text = re.sub(r'\*{1,2}(.*?)\*{1,2}', r'\1', text)  # Удаляем жирный/курсив
+            text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)  # Удаляем ссылки
+            
+            chunks = self._split_text(text)
+            logger.info(f"Markdown файл обработан, создано {len(chunks)} чанков")
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки Markdown: {e}")
+            return []
+
+    def _split_text(self, text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> List[str]:
+        """Разбивка текста на перекрывающиеся чанки"""
+        from app.config import settings
+        
+        chunk_size = settings.CHUNK_SIZE
+        chunk_overlap = settings.CHUNK_OVERLAP
+        
+        if len(text) <= chunk_size:
+            return [text] if text.strip() else []
+        
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
+            
+            # Если не конец текста, пытаемся закончить на границе предложения
+            if end < len(text):
+                # Ищем последнюю точку, восклицательный или вопросительный знак
+                sentence_end = max(
+                    text.rfind('.', start, end),
+                    text.rfind('!', start, end),
+                    text.rfind('?', start, end),
+                    text.rfind('\n', start, end)
+                )
+                
+                if sentence_end > start and sentence_end - start > chunk_size // 2:
+                    end = sentence_end + 1
+            
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            
+            start = end - chunk_overlap
+            
+            # Защита от бесконечного цикла
+            if start >= len(text):
+                break
+        
+        return chunks
+
+
+chat.py
+
+from typing import List, Optional
+from app.config import settings
+from app.services.llm_service import llm_service
+from app.services.reranker import reranker_service
+from app.services.vector_store import vector_store
+from fastapi import APIRouter, HTTPException
+from loguru import logger
+from pydantic import BaseModel, Field
+
+router = APIRouter()
+
+# Временное хранилище для истории диалогов
+conversation_store = {}
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+    use_reranking: bool = True
+
+class ChatResponse(BaseModel):
+    response: str = Field(default="")
+    conversation_id: str = Field(default="default")
+    sources: List[str] = Field(default_factory=list)
+    suggested_questions: List[str] = Field(default_factory=list)
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    try:
+        logger.info(f"Получен запрос чата: {request.message}")
+
+        # Создаем или получаем ID диалога
+        conversation_id = request.conversation_id or f"conv_{len(conversation_store) + 1}"
+
+        # Получаем историю диалога
+        history = conversation_store.get(conversation_id, [])
+
+        # Ищем релевантные документы с AWAIT
+        search_results = await vector_store.search(request.message, top_k=settings.TOP_K)
+        logger.info(f"Найдено документов: {len(search_results)}")
+
+        response_text = ""
+        sources = []
+
+        if not search_results:
+            response_text = (
+                "Извините, в моей базе знаний нет информации для ответа на этот вопрос."
+            )
+            logger.info("Документы не найдены, используем стандартный ответ")
+        else:
+            # Извлекаем тексты документов
+            documents = [result["document"] for result in search_results]
+            logger.info(f"Первый документ: {documents[0][:100]}..." if documents else "Нет документов")
+
+            # Реранкинг если включен
+            if request.use_reranking and len(documents) > 1:
+                logger.info("Применяем реранкинг документов")
+                reranked_docs = reranker_service.rerank(
+                    request.message, documents, top_k=settings.RERANK_TOP_K
+                )
+                context_docs = [doc for doc, score in reranked_docs]
+            else:
+                context_docs = documents[: settings.RERANK_TOP_K]
+
+            # Генерация ответа с контекстом
+            logger.info("Генерация ответа с контекстом...")
+            response_text = llm_service.generate_with_context(
+                question=request.message,
+                context=context_docs,
+                conversation_history=history,
+            )
+
+            # Проверяем что ответ не пустой
+            if not response_text or response_text.strip() == "":
+                response_text = "Не удалось получить ответ от модели. Пожалуйста, попробуйте еще раз."
+                logger.warning("Получен пустой ответ от модели")
+
+            sources = [result["document"][:100] + "..." for result in search_results[:3]]
+
+        # Обновляем историю диалога
+        history.extend([
+            {"role": "user", "content": request.message},
+            {"role": "assistant", "content": response_text},
+        ])
+
+        # Ограничиваем историю последними 10 сообщениями
+        conversation_store[conversation_id] = history[-10:]
+
+        # Предлагаемые вопросы
+        suggested_questions = [
+            "Какие документы можно загружать?",
+            "Как работает поиск?",
+            "Какие форматы файлов поддерживаются?",
+        ]
+
+        logger.info(f"Успешно сгенерирован ответ длиной {len(response_text)} символов")
+
+        return ChatResponse(
+            response=response_text,
+            conversation_id=conversation_id,
+            sources=sources,
+            suggested_questions=suggested_questions,
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка в чате: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка обработки запроса: {str(e)}")
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """Получить историю диалога"""
+    history = conversation_store.get(conversation_id, [])
+    return {"conversation_id": conversation_id, "history": history}
