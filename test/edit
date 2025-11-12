@@ -77,11 +77,12 @@
       },
       {
         "role": "роль2",
-        "text": "текст4 строка1\nтекст4 строка2\nтекст4 строка3\nтекст4 строка4"
+        "text": "строка1\nстрока2\nстрока3"
       }
     ]
   }
 ]
+
 
 [
   {
@@ -91,22 +92,186 @@
     "topic": "тема1",
     "source": "источник1",
     "dialogue": [
-      "текст1 строка1\nтекст1 строка2\nтекст1 строка3",
-      "текст2 строка1\nтекст2 строка2\nтекст2 строка3",
-      "текст3 строка1\nтекст3 строка2"
+      {
+        "role": "пользователь",
+        "lines": [
+          "Это первая строка пользователя",
+          "Это вторая строка пользователя", 
+          "Это третья строка пользователя"
+        ]
+      },
+      {
+        "role": "ассистент",
+        "lines": [
+          "Это ответ ассистента строка 1",
+          "Это ответ ассистента строка 2",
+          "Это ответ ассистента строка 3"
+        ]
+      },
+      {
+        "role": "пользователь", 
+        "lines": [
+          "Это новое сообщение пользователя"
+        ]
+      }
     ]
   },
   {
     "id": 2,
     "timestamp": "2024-01-15T11:00:00Z",
     "metadata": {},
-    "topic": "тема2", 
+    "topic": "тема2",
     "source": "источник2",
     "dialogue": [
-      "текст4 строка1\nтекст4 строка2",
-      "текст5 строка1\nтекст5 строка2\nтекст5 строка3\nтекст5 строка4",
-      "текст6 строка1"
+      {
+        "role": "модератор",
+        "lines": [
+          "Первая строка модератора",
+          "Вторая строка модератора"
+        ]
+      },
+      {
+        "role": "ассистент",
+        "lines": [
+          "Ответ ассистента модератору",
+          "Продолжение ответа",
+          "Завершение ответа"
+        ]
+      }
     ]
   }
 ]
+
+
+import json
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+def check_json_simple(file_path):
+    """Простая проверка JSON файла"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            data = json.loads(content)
+        print("✓ JSON файл корректен")
+        return True
+    except json.JSONDecodeError as e:
+        print(f"❌ Ошибка в JSON:")
+        print(f"   Строка {e.lineno}: {e.msg}")
+        
+        # Показываем проблемную строку
+        lines = content.split('\n')
+        if e.lineno <= len(lines):
+            error_line = lines[e.lineno - 1]
+            print(f"   Контекст: ...{error_line[max(0, e.colno-20):e.colno+20]}...")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+        return False
+
+def check_xml_simple(file_path):
+    """Простая проверка XML файла"""
+    try:
+        tree = ET.parse(file_path)
+        print("✓ XML файл корректен")
+        return True
+    except ET.ParseError as e:
+        print(f"❌ Ошибка в XML:")
+        print(f"   Строка {e.position[0]}: {e.msg}")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+        return False
+
+def read_json_simple(file_path):
+    """Простое чтение JSON файла"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        print("📖 Содержимое JSON:")
+        for i, item in enumerate(data):
+            print(f"  Объект {i+1}:")
+            print(f"    ID: {item.get('id', 'N/A')}")
+            print(f"    Topic: {item.get('topic', 'N/A')}")
+            
+            dialogue = item.get('dialogue', [])
+            if dialogue and isinstance(dialogue, list):
+                if isinstance(dialogue[0], str):
+                    # Формат: массив строк
+                    print(f"    Dialogue ({len(dialogue)} сообщений):")
+                    for j, text in enumerate(dialogue):
+                        preview = text.replace('\n', '\\n')[:50]
+                        print(f"      [{j}]: {preview}{'...' if len(text) > 50 else ''}")
+                else:
+                    # Формат: массив объектов
+                    print(f"    Dialogue ({len(dialogue)} сообщений):")
+                    for msg in dialogue:
+                        role = msg.get('role', 'N/A')
+                        text = msg.get('text', 'N/A')
+                        preview = text.replace('\n', '\\n')[:50]
+                        print(f"      [{role}]: {preview}{'...' if len(text) > 50 else ''}")
+            print()
+        return data
+    except Exception as e:
+        print(f"❌ Ошибка при чтении: {e}")
+        return None
+
+def read_xml_simple(file_path):
+    """Простое чтение XML файла"""
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        
+        print("📖 Содержимое XML:")
+        for i, item in enumerate(root.findall('.//item')):
+            print(f"  Объект {i+1}:")
+            print(f"    ID: {item.findtext('id', 'N/A')}")
+            print(f"    Topic: {item.findtext('topic', 'N/A')}")
+            
+            dialogue = item.find('dialogue')
+            if dialogue is not None:
+                messages = dialogue.findall('message')
+                if messages:
+                    print(f"    Dialogue ({len(messages)} сообщений):")
+                    for msg in messages:
+                        role = msg.findtext('role', 'N/A')
+                        text = msg.findtext('text', 'N/A')
+                        preview = text.replace('\n', '\\n')[:50]
+                        print(f"      [{role}]: {preview}{'...' if len(text) > 50 else ''}")
+            print()
+        return tree
+    except Exception as e:
+        print(f"❌ Ошибка при чтении: {e}")
+        return None
+
+def simple_file_check(file_path):
+    """Простая проверка файла любого формата"""
+    path = Path(file_path)
+    
+    if not path.exists():
+        print(f"❌ Файл {file_path} не найден")
+        return
+    
+    print(f"🔍 Проверка файла: {path.name}")
+    print("-" * 40)
+    
+    # Пробуем JSON
+    if check_json_simple(path):
+        read_json_simple(path)
+        return
+    
+    # Пробуем XML
+    if check_xml_simple(path):
+        read_xml_simple(path)
+        return
+    
+    print("❌ Файл не является корректным JSON или XML")
+
+# Пример использования
+if __name__ == "__main__":
+    # Просто укажите путь к вашему файлу
+    file_path = "ваш_файл.json"  # или .xml
+    
+    simple_file_check(file_path)
 
