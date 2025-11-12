@@ -1,0 +1,89 @@
+[
+  {
+    "metadata": {
+      "title": "текст1",
+      "description": "описание1",
+      "created_at": "2025-11-12T10:00:00Z",
+      "topic": ["тег1", "тег2"]
+    },
+    "dialogue_id": "id1",
+    "messages": [
+      {
+        "role": "user",
+        "content": "сообщение1",
+        "timestamp": "2025-11-12T10:00:05Z"
+      },
+      {
+        "role": "assistant",
+        "content": "сообщение2",
+        "timestamp": "2025-11-12T10:00:10Z"
+      }
+    ]
+  },
+  {
+    "metadata": {
+      "title": "текст2",
+      "description": "описание2",
+      "created_at": "2025-11-12T11:00:00Z",
+      "topic": ["тег3", "тег4"]
+    },
+    "dialogue_id": "id2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "сообщение3",
+        "timestamp": "2025-11-12T11:00:05Z"
+      },
+      {
+        "role": "assistant",
+        "content": "сообщение4",
+        "timestamp": "2025-11-12T11:00:10Z"
+      }
+    ]
+  }
+]
+
+
+import json
+import sys
+from pathlib import Path
+
+def validate_json_file(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        try:
+            json.loads(content)
+            print("✓ JSON файл корректен")
+            return True
+        except json.JSONDecodeError as e:
+            print("❌ Обнаружена ошибка в JSON:")
+            print(f"Строка {e.lineno}, столбец {e.colno}: {e.msg}")
+            
+            # Показываем контекст ошибки
+            lines = content.split('\n')
+            error_line = e.lineno - 1
+            start = max(0, error_line - 1)
+            end = min(len(lines), error_line + 2)
+            
+            for i in range(start, end):
+                marker = ">>> " if i == error_line else "    "
+                print(f"{marker}{i+1}: {lines[i]}")
+                if i == error_line:
+                    print(" " * (e.colno + 7) + "^")
+            return False
+            
+    except FileNotFoundError:
+        print(f"❌ Файл {file_path} не найден")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка при чтении файла: {e}")
+        return False
+
+if __name__ == "__main__":
+    # Укажите путь к вашему JSON-файлу
+    file_path = Path("путь/к/вашему/файлу.json")
+    
+    if not validate_json_file(file_path):
+        sys.exit(1)
