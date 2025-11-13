@@ -9,53 +9,50 @@ from openai import OpenAI
 client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
 
 def extract_json_from_response(text):
-    """Извлекает JSON из текстового ответа модели"""
-    
-    # Пытаемся найти JSON в тексте (может быть обернут в ```json или просто JSON)
-    json_patterns = [
-        r'```json\n(.*?)\n```',  # ```json ... ```
-        r'```(.*?)```',          # ``` ... ```
-        r'(\[{.*?}\])',          # JSON массив
-        r'({.*?})',              # JSON объект
-    ]
-    
-    for pattern in json_patterns:
-        matches = re.findall(pattern, text, re.DOTALL)
-        for match in matches:
-            try:
-                # Если нашли несколько совпадений, берем первое
-                json_str = match if isinstance(match, str) else match[0]
-                return json.loads(json_str)
-            except json.JSONDecodeError:
-                continue
-    
-    # Если не нашли в блоках кода, пробуем распарсить весь текст как JSON
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+    """Извлекает JSON из ответа модели, игнорируя размышления"""
+    if text is None:
         return None
+        
+    # Упрощенный подход: ищем первый [ или { и пытаемся распарсить оттуда
+    json_start_chars = ['[', '{']
+    
+    for start_char in json_start_chars:
+        start_idx = text.find(start_char)
+        if start_idx != -1:
+            # Берем подстроку от начала JSON до конца
+            json_str = text[start_idx:]
+            
+            # Пробуем распарсить, постепенно укорачивая строку если не получается
+            for end_idx in range(len(json_str), 0, -1):
+                try:
+                    potential_json = json_str[:end_idx]
+                    # Проверяем что это валидный JSON
+                    result = json.loads(potential_json)
+                    # Дополнительная проверка - должен быть список или словарь
+                    if isinstance(result, (list, dict)):
+                        return result
+                except json.JSONDecodeError:
+                    continue
+    
+    return None
 
 def create_strict_prompt(dialogue_text):
-    """Создает строгий промпт, чтобы модель возвращала только JSON"""
-    
-    return f"""
-ТЕКСТ ДЛЯ РАЗМЕТКИ:
+    """Создает очень строгий промпт"""
+    return f'''Верни ТОЛЬКО JSON без любых других текстов.
+
+Диалог для разметки:
 {dialogue_text}
 
-ЗАДАЧА: Замени все персональные данные на метки: [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL]
+Замени персональные данные на метки: [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL]
 
-ВЕРНИ ТОЛЬКО JSON в точном формате:
+Формат ответа (ТОЛЬКО JSON, БЕЗ ДРУГИХ ТЕКСТОВ):
 [
-  {{"role": "роль", "text": "текст с метками"}},
-  {{"role": "роль", "text": "текст с метками"}}
-]
-
-НЕ добавляй никаких объяснений, мыслей (think) или дополнительного текста.
-НЕ изменяй структуру, только замени персональные данные.
-"""
+  {{"role": "роль", "text": "текст"}},
+  {{"role": "роль", "text": "текст"}}
+]'''
 
 def process_single_dialog(dialog, output_file, failed_file):
-    """Обрабатывает один диалог и сохраняет результат"""
+    """Обрабатывает один диалог"""
     
     # Формируем текст диалога
     dialogue_text = "\n".join([f"{msg['role']}: {msg['text']}" for msg in dialog['dialogue']])
@@ -67,21 +64,25 @@ def process_single_dialog(dialog, output_file, failed_file):
                 "role": "user", 
                 "content": create_strict_prompt(dialogue_text)
             }],
-            temperature=0.1,
+            temperature=0.01,  # Минимальная случайность
             max_tokens=4000
         )
         
         result_text = response.choices[0].message.content
-        print(f"Ответ модели: {result_text[:200]}...")  # Логируем начало ответа
+        print(f"Ответ получен, длина: {len(result_text)} символов")
         
-        # Извлекаем JSON из ответа
+        # Извлекаем JSON
         annotated_dialogue = extract_json_from_response(result_text)
         
         if annotated_dialogue and isinstance(annotated_dialogue, list):
-            # Проверяем структуру
-            valid = all('role' in item and 'text' in item for item in annotated_dialogue)
+            # Проверяем что все элементы имеют правильную структуру
+            valid_structure = True
+            for item in annotated_dialogue:
+                if not isinstance(item, dict) or 'role' not in item or 'text' not in item:
+                    valid_structure = False
+                    break
             
-            if valid:
+            if valid_structure and len(annotated_dialogue) == len(dialog['dialogue']):
                 # Создаем размеченный диалог
                 annotated_dialog = dialog.copy()
                 annotated_dialog['dialogue'] = annotated_dialogue
@@ -89,68 +90,57 @@ def process_single_dialog(dialog, output_file, failed_file):
                 annotated_dialog['annotation_timestamp'] = time.time()
                 
                 # Сохраняем в основной файл
-                save_to_file(annotated_dialog, output_file)
+                save_to_jsonl(annotated_dialog, output_file)
                 print(f"✓ Успешно размечен диалог ID: {dialog['id']}")
                 return True
             else:
-                print(f"✗ Невалидная структура JSON в диалоге ID: {dialog['id']}")
+                print(f"✗ Неправильная структура в диалоге ID: {dialog['id']}")
         else:
-            print(f"✗ Не удалось извлечь JSON из ответа для диалога ID: {dialog['id']}")
+            print(f"✗ Не удалось извлечь JSON для диалога ID: {dialog['id']}")
             
     except Exception as e:
         print(f"✗ Ошибка при обработке диалога ID: {dialog['id']}: {str(e)}")
     
-    # Сохраняем в файл ошибок
-    save_failed_dialog(dialog, result_text, failed_file)
+    # Сохраняем информацию об ошибке
+    save_failed_attempt(dialog, result_text if 'result_text' in locals() else str(e), failed_file)
     return False
 
-def save_to_file(dialog, filename):
-    """Добавляет диалог в JSON файл (создает или дописывает)"""
-    
-    try:
-        # Пытаемся загрузить существующие данные
-        with open(filename, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = []
-    
-    # Удаляем старую версию этого диалога если есть
-    data = [d for d in data if d.get('id') != dialog.get('id')]
-    
-    # Добавляем новый диалог
-    data.append(dialog)
-    
-    # Сохраняем
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save_to_jsonl(dialog, filename):
+    """Сохраняет каждый диалог как отдельную строку в JSONL файл"""
+    with open(filename, 'a', encoding='utf-8') as f:
+        json_line = json.dumps(dialog, ensure_ascii=False)
+        f.write(json_line + '\n')
 
-def save_failed_dialog(dialog, model_response, failed_file):
-    """Сохраняет неудачную попытку разметки"""
-    
+def save_failed_attempt(dialog, model_response, failed_file):
+    """Сохраняет информацию о неудачной попытке"""
     failed_data = {
         'original_dialog': dialog,
         'model_response': model_response,
         'timestamp': time.time()
     }
     
+    with open(failed_file, 'a', encoding='utf-8') as f:
+        json_line = json.dumps(failed_data, ensure_ascii=False)
+        f.write(json_line + '\n')
+
+def load_existing_results(output_file):
+    """Загружает уже обработанные ID из выходного файла"""
+    processed_ids = set()
     try:
-        with open(failed_file, 'r', encoding='utf-8') as f:
-            failed_list = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        failed_list = []
-    
-    failed_list.append(failed_data)
-    
-    with open(failed_file, 'w', encoding='utf-8') as f:
-        json.dump(failed_list, f, ensure_ascii=False, indent=2)
+        with open(output_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                dialog = json.loads(line.strip())
+                processed_ids.add(str(dialog['id']))
+    except FileNotFoundError:
+        pass
+    return processed_ids
 
 def main():
     # Настройки
     input_file = "your_dataset.json"
-    output_file = "annotated_dataset.json"
-    failed_file = "failed_annotations.json"
-    start_id = 1  # С какого ID начать
-    max_dialogs = 2000  # Максимум для обработки
+    output_file = "annotated_dataset.jsonl"  # Теперь используем JSONL формат
+    failed_file = "failed_annotations.jsonl"
+    max_dialogs = 2000
     
     # Загрузка датасета
     with open(input_file, 'r', encoding='utf-8') as f:
@@ -158,11 +148,19 @@ def main():
     
     print(f"Загружено диалогов: {len(dataset)}")
     
-    # Фильтруем диалоги по ID
-    dialogs_to_process = [d for d in dataset if d['id'] >= start_id]
-    dialogs_to_process = dialogs_to_process[:max_dialogs]
+    # Загружаем уже обработанные ID
+    processed_ids = load_existing_results(output_file)
+    print(f"Уже обработано: {len(processed_ids)} диалогов")
     
-    print(f"Будет обработано: {len(dialogs_to_process)} диалогов")
+    # Фильтруем непроцессенные диалоги
+    dialogs_to_process = []
+    for dialog in dataset:
+        if str(dialog['id']) not in processed_ids:
+            dialogs_to_process.append(dialog)
+        if len(dialogs_to_process) >= max_dialogs:
+            break
+    
+    print(f"Будет обработано: {len(dialogs_to_process)} новых диалогов")
     
     success_count = 0
     fail_count = 0
@@ -184,12 +182,9 @@ def main():
     print(f"\n=== ИТОГ ===")
     print(f"Успешно: {success_count}")
     print(f"Неудачно: {fail_count}")
-    print(f"Результаты в: {output_file}")
-    print(f"Ошибки в: {failed_file}")
 
 if __name__ == "__main__":
     main()
-
 
 -----------
 
