@@ -1,3 +1,198 @@
+edit
+
+import json
+import time
+import re
+import os
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
+
+def extract_json_from_response(text):
+    """Извлекает JSON из текстового ответа модели"""
+    
+    # Пытаемся найти JSON в тексте (может быть обернут в ```json или просто JSON)
+    json_patterns = [
+        r'```json\n(.*?)\n```',  # ```json ... ```
+        r'```(.*?)```',          # ``` ... ```
+        r'(\[{.*?}\])',          # JSON массив
+        r'({.*?})',              # JSON объект
+    ]
+    
+    for pattern in json_patterns:
+        matches = re.findall(pattern, text, re.DOTALL)
+        for match in matches:
+            try:
+                # Если нашли несколько совпадений, берем первое
+                json_str = match if isinstance(match, str) else match[0]
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+    
+    # Если не нашли в блоках кода, пробуем распарсить весь текст как JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+def create_strict_prompt(dialogue_text):
+    """Создает строгий промпт, чтобы модель возвращала только JSON"""
+    
+    return f"""
+ТЕКСТ ДЛЯ РАЗМЕТКИ:
+{dialogue_text}
+
+ЗАДАЧА: Замени все персональные данные на метки: [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL]
+
+ВЕРНИ ТОЛЬКО JSON в точном формате:
+[
+  {{"role": "роль", "text": "текст с метками"}},
+  {{"role": "роль", "text": "текст с метками"}}
+]
+
+НЕ добавляй никаких объяснений, мыслей (think) или дополнительного текста.
+НЕ изменяй структуру, только замени персональные данные.
+"""
+
+def process_single_dialog(dialog, output_file, failed_file):
+    """Обрабатывает один диалог и сохраняет результат"""
+    
+    # Формируем текст диалога
+    dialogue_text = "\n".join([f"{msg['role']}: {msg['text']}" for msg in dialog['dialogue']])
+    
+    try:
+        response = client.chat.completions.create(
+            model="Qwen/Qwen3-8B-AWQ",
+            messages=[{
+                "role": "user", 
+                "content": create_strict_prompt(dialogue_text)
+            }],
+            temperature=0.1,
+            max_tokens=4000
+        )
+        
+        result_text = response.choices[0].message.content
+        print(f"Ответ модели: {result_text[:200]}...")  # Логируем начало ответа
+        
+        # Извлекаем JSON из ответа
+        annotated_dialogue = extract_json_from_response(result_text)
+        
+        if annotated_dialogue and isinstance(annotated_dialogue, list):
+            # Проверяем структуру
+            valid = all('role' in item and 'text' in item for item in annotated_dialogue)
+            
+            if valid:
+                # Создаем размеченный диалог
+                annotated_dialog = dialog.copy()
+                annotated_dialog['dialogue'] = annotated_dialogue
+                annotated_dialog['annotated'] = True
+                annotated_dialog['annotation_timestamp'] = time.time()
+                
+                # Сохраняем в основной файл
+                save_to_file(annotated_dialog, output_file)
+                print(f"✓ Успешно размечен диалог ID: {dialog['id']}")
+                return True
+            else:
+                print(f"✗ Невалидная структура JSON в диалоге ID: {dialog['id']}")
+        else:
+            print(f"✗ Не удалось извлечь JSON из ответа для диалога ID: {dialog['id']}")
+            
+    except Exception as e:
+        print(f"✗ Ошибка при обработке диалога ID: {dialog['id']}: {str(e)}")
+    
+    # Сохраняем в файл ошибок
+    save_failed_dialog(dialog, result_text, failed_file)
+    return False
+
+def save_to_file(dialog, filename):
+    """Добавляет диалог в JSON файл (создает или дописывает)"""
+    
+    try:
+        # Пытаемся загрузить существующие данные
+        with open(filename, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = []
+    
+    # Удаляем старую версию этого диалога если есть
+    data = [d for d in data if d.get('id') != dialog.get('id')]
+    
+    # Добавляем новый диалог
+    data.append(dialog)
+    
+    # Сохраняем
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def save_failed_dialog(dialog, model_response, failed_file):
+    """Сохраняет неудачную попытку разметки"""
+    
+    failed_data = {
+        'original_dialog': dialog,
+        'model_response': model_response,
+        'timestamp': time.time()
+    }
+    
+    try:
+        with open(failed_file, 'r', encoding='utf-8') as f:
+            failed_list = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        failed_list = []
+    
+    failed_list.append(failed_data)
+    
+    with open(failed_file, 'w', encoding='utf-8') as f:
+        json.dump(failed_list, f, ensure_ascii=False, indent=2)
+
+def main():
+    # Настройки
+    input_file = "your_dataset.json"
+    output_file = "annotated_dataset.json"
+    failed_file = "failed_annotations.json"
+    start_id = 1  # С какого ID начать
+    max_dialogs = 2000  # Максимум для обработки
+    
+    # Загрузка датасета
+    with open(input_file, 'r', encoding='utf-8') as f:
+        dataset = json.load(f)
+    
+    print(f"Загружено диалогов: {len(dataset)}")
+    
+    # Фильтруем диалоги по ID
+    dialogs_to_process = [d for d in dataset if d['id'] >= start_id]
+    dialogs_to_process = dialogs_to_process[:max_dialogs]
+    
+    print(f"Будет обработано: {len(dialogs_to_process)} диалогов")
+    
+    success_count = 0
+    fail_count = 0
+    
+    # Обработка каждого диалога
+    for i, dialog in enumerate(dialogs_to_process):
+        print(f"\n--- Обработка {i+1}/{len(dialogs_to_process)} (ID: {dialog['id']}) ---")
+        
+        success = process_single_dialog(dialog, output_file, failed_file)
+        
+        if success:
+            success_count += 1
+        else:
+            fail_count += 1
+        
+        # Пауза между запросами
+        time.sleep(1)
+    
+    print(f"\n=== ИТОГ ===")
+    print(f"Успешно: {success_count}")
+    print(f"Неудачно: {fail_count}")
+    print(f"Результаты в: {output_file}")
+    print(f"Ошибки в: {failed_file}")
+
+if __name__ == "__main__":
+    main()
+
+
+-----------
+
 import json
 import time
 from openai import OpenAI
