@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="ru">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Разметка персональных данных</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            }
+            .navigation {
+                display: flex;
+                gap: 10px;
+                margin-bottom: 20px;
+                align-items: center;
+            }
+            .dialogue-container {
+                border: 1px solid #ddd;
+                padding: 20px;
+                margin-bottom: 20px;
+                min-height: 400px;
+                background: #fafafa;
+                border-radius: 4px;
+            }
+            .message {
+                margin-bottom: 15px;
+                padding: 10px;
+                border-left: 3px solid #007acc;
+                background: white;
+            }
+            .message.agent {
+                border-left-color: #28a745;
+            }
+            .message.user {
+                border-left-color: #dc3545;
+            }
+            .role {
+                font-weight: bold;
+                color: #666;
+                margin-bottom: 5px;
+            }
+            .text-content {
+                white-space: pre-wrap;
+                line-height: 1.5;
+                cursor: text;
+                user-select: text;
+            }
+            .tags-container {
+                display: flex;
+                gap: 10px;
+                margin: 20px 0;
+                flex-wrap: wrap;
+            }
+            .tag-btn {
+                padding: 8px 16px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                color: white;
+                font-weight: bold;
+            }
+            .tag-fio {
+                background: #dc3545;
+            }
+            .tag-loc {
+                background: #fd7e14;
+            }
+            .tag-phone {
+                background: #6f42c1;
+            }
+            .tag-lk {
+                background: #20c997;
+            }
+            .tag-email {
+                background: #e83e8c;
+            }
+            .controls {
+                display: flex;
+                gap: 10px;
+                margin-top: 20px;
+            }
+            button {
+                padding: 10px 20px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                background: #007acc;
+                color: white;
+            }
+            button:hover {
+                opacity: 0.9;
+            }
+            .file-input {
+                margin-bottom: 20px;
+            }
+            .highlight {
+                background-color: yellow;
+                padding: 2px 4px;
+                border-radius: 2px;
+            }
+            .metadata {
+                background: #e9ecef;
+                padding: 10px;
+                border-radius: 4px;
+                margin-bottom: 15px;
+                font-size: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Разметка персональных данных</h1>
+
+            <div class="file-input">
+                <input type="file" id="jsonFile" accept=".json" />
+                <button onclick="loadSampleData()">
+                    Загрузить пример данных
+                </button>
+            </div>
+
+            <div class="navigation">
+                <button onclick="prevDialog()">← Предыдущий</button>
+                <span id="dialogInfo">Диалог: -/-</span>
+                <button onclick="nextDialog()">Следующий →</button>
+                <input
+                    type="number"
+                    id="jumpToId"
+                    placeholder="ID диалога"
+                    style="margin-left: 20px"
+                />
+                <button onclick="jumpToDialog()">Перейти</button>
+            </div>
+
+            <div class="metadata" id="metadata">
+                ID: <span id="currentId">-</span> | Тема:
+                <span id="currentTopic">-</span> | Источник:
+                <span id="currentSource">-</span> | Время:
+                <span id="currentTime">-</span>
+            </div>
+
+            <div class="dialogue-container" id="dialogueContainer">
+                <!-- Диалог будет отображаться здесь -->
+            </div>
+
+            <div class="tags-container">
+                <button class="tag-btn tag-fio" onclick="addTag('FIO')">
+                    FIO
+                </button>
+                <button class="tag-btn tag-loc" onclick="addTag('LOC')">
+                    LOC
+                </button>
+                <button class="tag-btn tag-phone" onclick="addTag('PHONE_NUM')">
+                    PHONE_NUM
+                </button>
+                <button class="tag-btn tag-lk" onclick="addTag('LK_NUM')">
+                    LK_NUM
+                </button>
+                <button class="tag-btn tag-email" onclick="addTag('EMAIL')">
+                    EMAIL
+                </button>
+            </div>
+
+            <div class="controls">
+                <button onclick="exportData()">Экспорт данных</button>
+                <button onclick="clearHighlights()">Очистить выделения</button>
+                <button onclick="saveProgress()">Сохранить прогресс</button>
+            </div>
+        </div>
+
+        <script>
+            let dataset = [];
+            let currentDialogIndex = 0;
+            let selectedText = "";
+            let selectedElement = null;
+
+            // Загрузка файла JSON
+            document
+                .getElementById("jsonFile")
+                .addEventListener("change", function (e) {
+                    const file = e.target.files[0];
+                    if (file) {
+                        const reader = new FileReader();
+                        reader.onload = function (e) {
+                            try {
+                                dataset = JSON.parse(e.target.result);
+                                currentDialogIndex = 0;
+                                loadCurrentDialog();
+                            } catch (error) {
+                                alert(
+                                    "Ошибка загрузки файла: " + error.message,
+                                );
+                            }
+                        };
+                        reader.readAsText(file);
+                    }
+                });
+
+            // Загрузка пример данных для тестирования
+            function loadSampleData() {
+                dataset = [
+                    {
+                        id: 1,
+                        timestamp: "2024-01-15T10:30:00Z",
+                        metadata: {},
+                        topic: "Проблема с доступом",
+                        source: "веб-сайт",
+                        dialogue: [
+                            {
+                                role: "user",
+                                text: "Здравствуйте, меня зовут Иванов Иван Иванович, я из города Москва. Мой номер телефона 89161234567, email ivanov@mail.ru. Не могу войти в личный кабинет номер 123456.",
+                            },
+                            {
+                                role: "support",
+                                text: "Иван Иванович, проверьте ваш личный кабинет 123456. Мы отправили код подтверждения на ivanov@mail.ru",
+                            },
+                        ],
+                    },
+                    {
+                        id: 2,
+                        timestamp: "2024-01-15T11:00:00Z",
+                        metadata: {},
+                        topic: "Техническая проблема",
+                        source: "телефон",
+                        dialogue: [
+                            {
+                                role: "user",
+                                text: "Петров Петр из Санкт-Петербурга, телефон +7-916-765-43-21, petrov@gmail.com. ЛК 654321 не работает.",
+                            },
+                            {
+                                role: "support",
+                                text: "Петр, по номеру 654321 вижу проблему. Перезвоню на +7-916-765-43-21.",
+                            },
+                        ],
+                    },
+                ];
+                currentDialogIndex = 0;
+                loadCurrentDialog();
+            }
+
+            // Загрузка текущего диалога
+            function loadCurrentDialog() {
+                if (dataset.length === 0) return;
+
+                const dialog = dataset[currentDialogIndex];
+                const container = document.getElementById("dialogueContainer");
+
+                // Обновление информации
+                document.getElementById("currentId").textContent = dialog.id;
+                document.getElementById("currentTopic").textContent =
+                    dialog.topic;
+                document.getElementById("currentSource").textContent =
+                    dialog.source;
+                document.getElementById("currentTime").textContent = new Date(
+                    dialog.timestamp,
+                ).toLocaleString();
+                document.getElementById("dialogInfo").textContent =
+                    `Диалог: ${currentDialogIndex + 1}/${dataset.length}`;
+
+                // Очистка контейнера
+                container.innerHTML = "";
+
+                // Отображение сообщений
+                dialog.dialogue.forEach((message, index) => {
+                    const messageDiv = document.createElement("div");
+                    messageDiv.className = `message ${message.role === "support" ? "agent" : "user"}`;
+
+                    const roleDiv = document.createElement("div");
+                    roleDiv.className = "role";
+                    roleDiv.textContent =
+                        message.role === "support"
+                            ? "Поддержка"
+                            : "Пользователь";
+
+                    const textDiv = document.createElement("div");
+                    textDiv.className = "text-content";
+                    textDiv.id = `message-${currentDialogIndex}-${index}`;
+                    textDiv.textContent = message.text;
+                    textDiv.addEventListener("mouseup", handleTextSelection);
+
+                    messageDiv.appendChild(roleDiv);
+                    messageDiv.appendChild(textDiv);
+                    container.appendChild(messageDiv);
+                });
+            }
+
+            // Обработка выделения текста
+            function handleTextSelection() {
+                const selection = window.getSelection();
+                if (selection.toString().trim() !== "") {
+                    selectedText = selection.toString();
+                    selectedElement = selection.anchorNode.parentElement;
+
+                    // Подсветка выделенного текста
+                    const range = selection.getRangeAt(0);
+                    const highlight = document.createElement("span");
+                    highlight.className = "highlight";
+                    highlight.textContent = selectedText;
+                    range.deleteContents();
+                    range.insertNode(highlight);
+
+                    selection.removeAllRanges();
+                }
+            }
+
+            // Добавление метки
+            function addTag(tagType) {
+                if (!selectedText || !selectedElement) {
+                    alert("Сначала выделите текст для замены");
+                    return;
+                }
+
+                const tag = `[${tagType}]`;
+                const highlighted = selectedElement.querySelector(".highlight");
+
+                if (highlighted) {
+                    highlighted.outerHTML = tag;
+
+                    // Обновление данных
+                    const elementId = selectedElement.id;
+                    const [_, dialogIndex, messageIndex] = elementId.split("-");
+                    dataset[dialogIndex].dialogue[messageIndex].text =
+                        selectedElement.textContent;
+
+                    selectedText = "";
+                    selectedElement = null;
+                }
+            }
+
+            // Навигация
+            function prevDialog() {
+                if (currentDialogIndex > 0) {
+                    currentDialogIndex--;
+                    loadCurrentDialog();
+                }
+            }
+
+            function nextDialog() {
+                if (currentDialogIndex < dataset.length - 1) {
+                    currentDialogIndex++;
+                    loadCurrentDialog();
+                }
+            }
+
+            function jumpToDialog() {
+                const id = parseInt(document.getElementById("jumpToId").value);
+                const index = dataset.findIndex((dialog) => dialog.id === id);
+                if (index !== -1) {
+                    currentDialogIndex = index;
+                    loadCurrentDialog();
+                } else {
+                    alert("Диалог с таким ID не найден");
+                }
+            }
+
+            // Очистка выделений
+            function clearHighlights() {
+                const highlights = document.querySelectorAll(".highlight");
+                highlights.forEach((highlight) => {
+                    highlight.outerHTML = highlight.textContent;
+                });
+                selectedText = "";
+                selectedElement = null;
+            }
+
+            // Сохранение прогресса в localStorage
+            function saveProgress() {
+                localStorage.setItem(
+                    "annotatedDataset",
+                    JSON.stringify(dataset),
+                );
+                localStorage.setItem(
+                    "currentIndex",
+                    currentDialogIndex.toString(),
+                );
+                alert("Прогресс сохранен!");
+            }
+
+            // Загрузка прогресса
+            function loadProgress() {
+                const savedData = localStorage.getItem("annotatedDataset");
+                const savedIndex = localStorage.getItem("currentIndex");
+                if (savedData) {
+                    dataset = JSON.parse(savedData);
+                    currentDialogIndex = parseInt(savedIndex) || 0;
+                    loadCurrentDialog();
+                }
+            }
+
+            // Экспорт данных
+            function exportData() {
+                if (dataset.length === 0) {
+                    alert("Нет данных для экспорта");
+                    return;
+                }
+
+                const dataStr = JSON.stringify(dataset, null, 2);
+                const dataBlob = new Blob([dataStr], {
+                    type: "application/json",
+                });
+
+                const url = URL.createObjectURL(dataBlob);
+                const link = document.createElement("a");
+                link.href = url;
+                link.download =
+                    "/home/user/zed_projects/llm_rag/annotator/annotated_dataset.json";
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+            }
+
+            // Загрузка прогресса при старте
+            window.onload = function () {
+                loadProgress();
+            };
+        </script>
+    </body>
+</html>
