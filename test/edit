@@ -1,41 +1,158 @@
-import json
 import re
 
-def fix_backslashes_in_text(obj):
+def fix_json_backslashes_text(input_file, output_file):
     """
-    Рекурсивно обрабатывает все строки в объекте JSON, заменяя обратные слеши 
-    на прямые, кроме последовательности \n.
+    Исправляет обратные слеши в JSON файле, обрабатывая его как текст.
+    Сохраняет \n, но заменяет другие обратные слеши на прямые.
     """
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(value, str):
-                # Заменяем все одиночные обратные слеши, кроме \n
-                obj[key] = re.sub(r'\\(?!n)', '/', value)
-            else:
-                fix_backslashes_in_text(value)
-    elif isinstance(obj, list):
-        for item in obj:
-            fix_backslashes_in_text(item)
-
-def process_json_file(input_file, output_file):
-    """Читает, обрабатывает и сохраняет JSON-файл"""
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            content = f.read()
         
-        fix_backslashes_in_text(data)
+        # Шаблон для нахождения "text": "..." и исправления слешей внутри значений
+        # Обрабатывает как двойные, так и одинарные кавычки
+        def replace_slashes_in_quotes(match):
+            text_content = match.group(1)
+            # Заменяем обратные слеши на прямые, но сохраняем \n
+            # Используем негативный просмотр вперед (?!n) чтобы не трогать \n
+            text_content = re.sub(r'\\(?!n)', '/', text_content)
+            return f'"{text_content}"'
+        
+        # Обрабатываем строки в двойных кавычках
+        content = re.sub(r'"([^"\\]*(\\.[^"\\]*)*)"', 
+                        lambda m: f'"{re.sub(r"\\(?!n)", "/", m.group(1))}"', 
+                        content)
+        
+        # Альтернативный подход: находим все строковые значения и обрабатываем их
+        # Это более безопасный метод
+        def fix_all_strings(match):
+            full_match = match.group(0)
+            # Если это ключ, оставляем как есть
+            if re.search(r'^\s*"[^"]*"\s*:', full_match):
+                return full_match
+            # Если это значение строки - обрабатываем
+            return re.sub(r'\\(?!n)', '/', full_match)
+        
+        # Применяем ко всем строкам в кавычках
+        content = re.sub(r'"[^"\\]*(\\.[^"\\]*)*"', 
+                        lambda m: f'"{re.sub(r"\\(?!n)", "/", m.group(1))}"' if m.group(1) else m.group(0), 
+                        content)
         
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write(content)
         
-        print(f"Файл успешно обработан. Результат сохранен в {output_file}")
+        print(f"Файл успешно обработан как текст. Результат в {output_file}")
+        
+        # Пробуем открыть как JSON для проверки
+        try:
+            import json
+            with open(output_file, 'r', encoding='utf-8') as f:
+                json.load(f)
+            print("✅ Исправленный файл успешно проходит валидацию JSON")
+        except json.JSONDecodeError as e:
+            print(f"⚠️  Файл обработан, но есть проблемы с JSON: {e}")
     
     except Exception as e:
         print(f"Ошибка при обработке файла: {e}")
 
-# Использование
-if __name__ == "__main__":
-    input_filename = "input.json"  # Замените на ваш файл
-    output_filename = "output.json"  # Выходной файл
+# Упрощенная версия - просто заменяем все обратные слеши, кроме \n
+def fix_simple_backslashes(input_file, output_file):
+    """
+    Простая замена всех обратных слешей кроме \n
+    """
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Заменяем все обратные слеши, кроме тех, что являются частью \n
+        result = []
+        i = 0
+        while i < len(content):
+            if content[i] == '\\' and i + 1 < len(content) and content[i + 1] == 'n':
+                result.append('\\n')
+                i += 2
+            elif content[i] == '\\':
+                result.append('/')
+                i += 1
+            else:
+                result.append(content[i])
+                i += 1
+        
+        fixed_content = ''.join(result)
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(fixed_content)
+        
+        print(f"Файл обработан простым методом. Результат в {output_file}")
+        
+    except Exception as e:
+        print(f"Ошибка: {e}")
+
+# Умная замена только в строковых значениях (рекомендуется)
+def fix_smart_backslashes(input_file, output_file):
+    """
+    Умная замена обратных слешей только внутри строковых значений JSON
+    """
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Функция для обработки найденных строк
+        def process_string(match):
+            string_content = match.group(1)
+            # Заменяем обратные слеши, кроме \n
+            processed = re.sub(r'\\(?!n)', '/', string_content)
+            return f'"{processed}"'
+        
+        # Регулярное выражение для нахождения строк в двойных кавычках
+        # Игнорирует экранированные кавычки внутри строк
+        pattern = r'"((?:[^"\\]|\\.)*)"'
+        
+        fixed_content = re.sub(pattern, process_string, content)
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(fixed_content)
+        
+        print(f"Файл обработан умным методом. Результат в {output_file}")
+        
+        # Проверяем валидность JSON
+        try:
+            import json
+            with open(output_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            print("✅ JSON валиден после обработки")
+            return True
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON невалиден: {e}")
+            return False
+            
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return False
+
+# Основная функция с выбором метода
+def main():
+    input_file = "problematic.json"  # Ваш проблемный файл
+    output_file = "fixed.json"       # Исправленный файл
     
-    process_json_file(input_filename, output_filename)
+    print("Выберите метод обработки:")
+    print("1 - Простая замена всех слешей (быстро)")
+    print("2 - Умная замена только в строках (рекомендуется)")
+    print("3 - Обработка как текста (универсально)")
+    
+    choice = input("Введите номер метода (1-3): ").strip()
+    
+    if choice == "1":
+        fix_simple_backslashes(input_file, output_file)
+    elif choice == "2":
+        success = fix_smart_backslashes(input_file, output_file)
+        if not success:
+            print("Попробуйте метод 1 или 3")
+    elif choice == "3":
+        fix_json_backslashes_text(input_file, output_file)
+    else:
+        print("Используем рекомендуемый метод (2)")
+        fix_smart_backslashes(input_file, output_file)
+
+if __name__ == "__main__":
+    main()
