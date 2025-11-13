@@ -9,53 +9,40 @@ from openai import OpenAI
 client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
 
 def extract_clean_response(text):
-    """Извлекает чистый ответ модели, убирая think-блоки"""
+    """Извлекает чистый ответ, убирая всё лишнее"""
     if text is None:
         return ""
     
-    # Удаляем блоки размышлений в различных форматах
+    # Удаляем все теги форматирования и размышления
     clean_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    clean_text = re.sub(r'思考.*?\n', '', clean_text, flags=re.DOTALL)
-    clean_text = re.sub(r'Reasoning:.*?\n', '', clean_text, flags=re.DOTALL)
-    clean_text = re.sub(r'Размышляю:.*?\n', '', clean_text, flags=re.DOTALL)
+    clean_text = re.sub(r'\*\*.*?\*\*', '', clean_text)  # Жирный текст
+    clean_text = re.sub(r'\*.*?\*', '', clean_text)      # Курсив
+    clean_text = re.sub(r'`.*?`', '', clean_text)        # Код
+    clean_text = re.sub(r'#+', '', clean_text)           # Заголовки
+    clean_text = re.sub(r'РАЗМЕЧЕННЫЙ ДИАЛОГ:?', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'РАЗМЕЧЕННЫЙ ТЕКСТ:?', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'АННОТИРОВАННЫЙ ТЕКСТ:?', '', clean_text, flags=re.IGNORECASE)
     
-    # Убираем маркеры размышлений
-    lines = clean_text.strip().split('\n')
-    clean_lines = []
+    # Убираем лишние пробелы и переносы
+    clean_text = re.sub(r'\n+', ' ', clean_text)
+    clean_text = re.sub(r'\s+', ' ', clean_text)
     
-    for line in lines:
-        line = line.strip()
-        # Пропускаем строки с размышлениями
-        if any(word in line.lower() for word in ['think', 'размышляю', 'сначала', 'итак', 'reasoning', 'thought:']):
-            continue
-        if line and not line.startswith('//') and not line.startswith('#'):
-            clean_lines.append(line)
-    
-    result = '\n'.join(clean_lines).strip()
-    return result if result else "ОШИБКА: Пустой ответ"
+    return clean_text.strip()
 
-def create_simple_prompt(dialogue_text):
-    """Создает простой промпт"""
+def create_message_prompt(message_text):
+    """Промпт для одного сообщения"""
     return f'''
-Замени все персональные данные в диалоге на метки: [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL]
+Замени персональные данные на метки [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL] в этом тексте:
 
-ДИАЛОГ:
-{dialogue_text}
+{message_text}
 
-РАЗМЕЧЕННЫЙ ДИАЛОГ:
+Ответ (только текст с метками, без пояснений):
 '''
-
-def format_dialogue_for_csv(dialogue):
-    """Форматирует диалог в строку для CSV"""
-    parts = []
-    for msg in dialogue:
-        parts.append(f"{msg['role']}: {msg['text']}")
-    return " | ".join(parts)
 
 def main():
     # Настройки
     input_file = "your_dataset.json"
-    output_file = "annotated_dataset.csv"
+    output_file = "annotated_messages.csv"
     max_dialogs = 2000
     
     # Загрузка датасета
@@ -66,75 +53,73 @@ def main():
     
     # Создаем CSV файл
     with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['id', 'topic', 'source', 'original_dialogue', 'annotated_dialogue', 'timestamp']
+        fieldnames = ['id', 'original_message', 'annotated_message']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         
         writer.writeheader()
         
+        total_messages = 0
         success_count = 0
-        fail_count = 0
         
         # Обработка диалогов
         for i, dialog in enumerate(dataset[:max_dialogs]):
-            print(f"\n--- Обработка {i+1}/{min(len(dataset), max_dialogs)} (ID: {dialog['id']}) ---")
+            print(f"Обработка диалога {i+1}/{min(len(dataset), max_dialogs)} (ID: {dialog['id']})")
             
-            # Форматируем оригинальный диалог
-            original_dialogue = format_dialogue_for_csv(dialog['dialogue'])
-            
-            try:
-                # Отправляем запрос модели
-                response = client.chat.completions.create(
-                    model="Qwen/Qwen3-8B-AWQ",
-                    messages=[{
-                        "role": "user", 
-                        "content": create_simple_prompt(original_dialogue)
-                    }],
-                    temperature=0.1,
-                    max_tokens=4000
-                )
+            # Обрабатываем каждое сообщение отдельно
+            for message in dialog['dialogue']:
+                original_text = message['text']
                 
-                result_text = response.choices[0].message.content
-                print(f"Ответ получен, длина: {len(result_text)} символов")
+                # Очищаем оригинальный текст от переносов
+                clean_original = re.sub(r'\n+', ' ', original_text)
+                clean_original = re.sub(r'\s+', ' ', clean_original).strip()
                 
-                # Очищаем ответ от размышлений
-                clean_response = extract_clean_response(result_text)
+                try:
+                    # Отправляем запрос для одного сообщения
+                    response = client.chat.completions.create(
+                        model="Qwen3-8B-AWQ",
+                        messages=[{
+                            "role": "user", 
+                            "content": create_message_prompt(clean_original)
+                        }],
+                        temperature=0.1,
+                        max_tokens=2000
+                    )
+                    
+                    result_text = response.choices[0].message.content
+                    
+                    # Очищаем ответ
+                    clean_response = extract_clean_response(result_text)
+                    
+                    # Сохраняем в CSV
+                    writer.writerow({
+                        'id': dialog['id'],
+                        'original_message': clean_original,
+                        'annotated_message': clean_response
+                    })
+                    
+                    success_count += 1
+                    total_messages += 1
+                    
+                    print(f"  ✓ Сообщение {total_messages} обработано")
+                    
+                except Exception as e:
+                    print(f"  ✗ Ошибка в сообщении: {str(e)}")
+                    
+                    # Сохраняем оригинал с пометкой об ошибке
+                    writer.writerow({
+                        'id': dialog['id'],
+                        'original_message': clean_original,
+                        'annotated_message': f"ОШИБКА: {str(e)}"
+                    })
+                    total_messages += 1
                 
-                # Сохраняем в CSV
-                writer.writerow({
-                    'id': dialog['id'],
-                    'topic': dialog['topic'],
-                    'source': dialog['source'],
-                    'original_dialogue': original_dialogue,
-                    'annotated_dialogue': clean_response,
-                    'timestamp': time.time()
-                })
-                
-                success_count += 1
-                print(f"✓ Успешно сохранен диалог ID: {dialog['id']}")
-                
-            except Exception as e:
-                error_msg = f"ОШИБКА: {str(e)}"
-                print(f"✗ Ошибка при обработке диалога ID: {dialog['id']}: {error_msg}")
-                
-                # Сохраняем диалог с ошибкой
-                writer.writerow({
-                    'id': dialog['id'],
-                    'topic': dialog['topic'],
-                    'source': dialog['source'],
-                    'original_dialogue': original_dialogue,
-                    'annotated_dialogue': error_msg,
-                    'timestamp': time.time()
-                })
-                
-                fail_count += 1
-            
-            # Пауза между запросами
-            time.sleep(1)
+                # Пауза между запросами
+                time.sleep(0.5)
     
     print(f"\n=== ИТОГ ===")
+    print(f"Обработано сообщений: {total_messages}")
     print(f"Успешно: {success_count}")
-    print(f"С ошибками: {fail_count}")
-    print(f"Результаты сохранены в: {output_file}")
+    print(f"Файл сохранен: {output_file}")
 
 if __name__ == "__main__":
     main()
