@@ -1,145 +1,61 @@
 edit
 
 import json
+import csv
 import time
 import re
-import os
 from openai import OpenAI
 
 client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
 
-def extract_json_from_response(text):
-    """Извлекает JSON из ответа модели, игнорируя размышления"""
+def extract_clean_response(text):
+    """Извлекает чистый ответ модели, убирая think-блоки"""
     if text is None:
-        return None
-        
-    # Упрощенный подход: ищем первый [ или { и пытаемся распарсить оттуда
-    json_start_chars = ['[', '{']
+        return ""
     
-    for start_char in json_start_chars:
-        start_idx = text.find(start_char)
-        if start_idx != -1:
-            # Берем подстроку от начала JSON до конца
-            json_str = text[start_idx:]
-            
-            # Пробуем распарсить, постепенно укорачивая строку если не получается
-            for end_idx in range(len(json_str), 0, -1):
-                try:
-                    potential_json = json_str[:end_idx]
-                    # Проверяем что это валидный JSON
-                    result = json.loads(potential_json)
-                    # Дополнительная проверка - должен быть список или словарь
-                    if isinstance(result, (list, dict)):
-                        return result
-                except json.JSONDecodeError:
-                    continue
+    # Удаляем блоки размышлений в различных форматах
+    clean_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    clean_text = re.sub(r'思考.*?\n', '', clean_text, flags=re.DOTALL)
+    clean_text = re.sub(r'Reasoning:.*?\n', '', clean_text, flags=re.DOTALL)
+    clean_text = re.sub(r'Размышляю:.*?\n', '', clean_text, flags=re.DOTALL)
     
-    return None
+    # Убираем маркеры размышлений
+    lines = clean_text.strip().split('\n')
+    clean_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        # Пропускаем строки с размышлениями
+        if any(word in line.lower() for word in ['think', 'размышляю', 'сначала', 'итак', 'reasoning', 'thought:']):
+            continue
+        if line and not line.startswith('//') and not line.startswith('#'):
+            clean_lines.append(line)
+    
+    result = '\n'.join(clean_lines).strip()
+    return result if result else "ОШИБКА: Пустой ответ"
 
-def create_strict_prompt(dialogue_text):
-    """Создает очень строгий промпт"""
-    return f'''Верни ТОЛЬКО JSON без любых других текстов.
+def create_simple_prompt(dialogue_text):
+    """Создает простой промпт"""
+    return f'''
+Замени все персональные данные в диалоге на метки: [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL]
 
-Диалог для разметки:
+ДИАЛОГ:
 {dialogue_text}
 
-Замени персональные данные на метки: [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL]
+РАЗМЕЧЕННЫЙ ДИАЛОГ:
+'''
 
-Формат ответа (ТОЛЬКО JSON, БЕЗ ДРУГИХ ТЕКСТОВ):
-[
-  {{"role": "роль", "text": "текст"}},
-  {{"role": "роль", "text": "текст"}}
-]'''
-
-def process_single_dialog(dialog, output_file, failed_file):
-    """Обрабатывает один диалог"""
-    
-    # Формируем текст диалога
-    dialogue_text = "\n".join([f"{msg['role']}: {msg['text']}" for msg in dialog['dialogue']])
-    
-    try:
-        response = client.chat.completions.create(
-            model="Qwen/Qwen3-8B-AWQ",
-            messages=[{
-                "role": "user", 
-                "content": create_strict_prompt(dialogue_text)
-            }],
-            temperature=0.01,  # Минимальная случайность
-            max_tokens=4000
-        )
-        
-        result_text = response.choices[0].message.content
-        print(f"Ответ получен, длина: {len(result_text)} символов")
-        
-        # Извлекаем JSON
-        annotated_dialogue = extract_json_from_response(result_text)
-        
-        if annotated_dialogue and isinstance(annotated_dialogue, list):
-            # Проверяем что все элементы имеют правильную структуру
-            valid_structure = True
-            for item in annotated_dialogue:
-                if not isinstance(item, dict) or 'role' not in item or 'text' not in item:
-                    valid_structure = False
-                    break
-            
-            if valid_structure and len(annotated_dialogue) == len(dialog['dialogue']):
-                # Создаем размеченный диалог
-                annotated_dialog = dialog.copy()
-                annotated_dialog['dialogue'] = annotated_dialogue
-                annotated_dialog['annotated'] = True
-                annotated_dialog['annotation_timestamp'] = time.time()
-                
-                # Сохраняем в основной файл
-                save_to_jsonl(annotated_dialog, output_file)
-                print(f"✓ Успешно размечен диалог ID: {dialog['id']}")
-                return True
-            else:
-                print(f"✗ Неправильная структура в диалоге ID: {dialog['id']}")
-        else:
-            print(f"✗ Не удалось извлечь JSON для диалога ID: {dialog['id']}")
-            
-    except Exception as e:
-        print(f"✗ Ошибка при обработке диалога ID: {dialog['id']}: {str(e)}")
-    
-    # Сохраняем информацию об ошибке
-    save_failed_attempt(dialog, result_text if 'result_text' in locals() else str(e), failed_file)
-    return False
-
-def save_to_jsonl(dialog, filename):
-    """Сохраняет каждый диалог как отдельную строку в JSONL файл"""
-    with open(filename, 'a', encoding='utf-8') as f:
-        json_line = json.dumps(dialog, ensure_ascii=False)
-        f.write(json_line + '\n')
-
-def save_failed_attempt(dialog, model_response, failed_file):
-    """Сохраняет информацию о неудачной попытке"""
-    failed_data = {
-        'original_dialog': dialog,
-        'model_response': model_response,
-        'timestamp': time.time()
-    }
-    
-    with open(failed_file, 'a', encoding='utf-8') as f:
-        json_line = json.dumps(failed_data, ensure_ascii=False)
-        f.write(json_line + '\n')
-
-def load_existing_results(output_file):
-    """Загружает уже обработанные ID из выходного файла"""
-    processed_ids = set()
-    try:
-        with open(output_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                dialog = json.loads(line.strip())
-                processed_ids.add(str(dialog['id']))
-    except FileNotFoundError:
-        pass
-    return processed_ids
+def format_dialogue_for_csv(dialogue):
+    """Форматирует диалог в строку для CSV"""
+    parts = []
+    for msg in dialogue:
+        parts.append(f"{msg['role']}: {msg['text']}")
+    return " | ".join(parts)
 
 def main():
     # Настройки
     input_file = "your_dataset.json"
-    output_file = "annotated_dataset.jsonl"  # Теперь используем JSONL формат
-    failed_file = "failed_annotations.jsonl"
+    output_file = "annotated_dataset.csv"
     max_dialogs = 2000
     
     # Загрузка датасета
@@ -148,43 +64,81 @@ def main():
     
     print(f"Загружено диалогов: {len(dataset)}")
     
-    # Загружаем уже обработанные ID
-    processed_ids = load_existing_results(output_file)
-    print(f"Уже обработано: {len(processed_ids)} диалогов")
-    
-    # Фильтруем непроцессенные диалоги
-    dialogs_to_process = []
-    for dialog in dataset:
-        if str(dialog['id']) not in processed_ids:
-            dialogs_to_process.append(dialog)
-        if len(dialogs_to_process) >= max_dialogs:
-            break
-    
-    print(f"Будет обработано: {len(dialogs_to_process)} новых диалогов")
-    
-    success_count = 0
-    fail_count = 0
-    
-    # Обработка каждого диалога
-    for i, dialog in enumerate(dialogs_to_process):
-        print(f"\n--- Обработка {i+1}/{len(dialogs_to_process)} (ID: {dialog['id']}) ---")
+    # Создаем CSV файл
+    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['id', 'topic', 'source', 'original_dialogue', 'annotated_dialogue', 'timestamp']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         
-        success = process_single_dialog(dialog, output_file, failed_file)
+        writer.writeheader()
         
-        if success:
-            success_count += 1
-        else:
-            fail_count += 1
+        success_count = 0
+        fail_count = 0
         
-        # Пауза между запросами
-        time.sleep(1)
+        # Обработка диалогов
+        for i, dialog in enumerate(dataset[:max_dialogs]):
+            print(f"\n--- Обработка {i+1}/{min(len(dataset), max_dialogs)} (ID: {dialog['id']}) ---")
+            
+            # Форматируем оригинальный диалог
+            original_dialogue = format_dialogue_for_csv(dialog['dialogue'])
+            
+            try:
+                # Отправляем запрос модели
+                response = client.chat.completions.create(
+                    model="Qwen/Qwen3-8B-AWQ",
+                    messages=[{
+                        "role": "user", 
+                        "content": create_simple_prompt(original_dialogue)
+                    }],
+                    temperature=0.1,
+                    max_tokens=4000
+                )
+                
+                result_text = response.choices[0].message.content
+                print(f"Ответ получен, длина: {len(result_text)} символов")
+                
+                # Очищаем ответ от размышлений
+                clean_response = extract_clean_response(result_text)
+                
+                # Сохраняем в CSV
+                writer.writerow({
+                    'id': dialog['id'],
+                    'topic': dialog['topic'],
+                    'source': dialog['source'],
+                    'original_dialogue': original_dialogue,
+                    'annotated_dialogue': clean_response,
+                    'timestamp': time.time()
+                })
+                
+                success_count += 1
+                print(f"✓ Успешно сохранен диалог ID: {dialog['id']}")
+                
+            except Exception as e:
+                error_msg = f"ОШИБКА: {str(e)}"
+                print(f"✗ Ошибка при обработке диалога ID: {dialog['id']}: {error_msg}")
+                
+                # Сохраняем диалог с ошибкой
+                writer.writerow({
+                    'id': dialog['id'],
+                    'topic': dialog['topic'],
+                    'source': dialog['source'],
+                    'original_dialogue': original_dialogue,
+                    'annotated_dialogue': error_msg,
+                    'timestamp': time.time()
+                })
+                
+                fail_count += 1
+            
+            # Пауза между запросами
+            time.sleep(1)
     
     print(f"\n=== ИТОГ ===")
     print(f"Успешно: {success_count}")
-    print(f"Неудачно: {fail_count}")
+    print(f"С ошибками: {fail_count}")
+    print(f"Результаты сохранены в: {output_file}")
 
 if __name__ == "__main__":
     main()
+
 
 -----------
 
