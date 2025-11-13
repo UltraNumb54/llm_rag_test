@@ -1,0 +1,31 @@
+python check_data.py messages.csv all
+
+# simple_check.py - упрощенная версия для проверки
+import pandas as pd
+import sys
+
+def simple_check(filename):
+    """Простая проверка CSV файла"""
+    try:
+        df = pd.read_csv(filename, quoting=csv.QUOTE_ALL, encoding='utf-8')
+        
+        print(f"Файл: {filename}")
+        print(f"Записей: {len(df)}")
+        print(f"Уникальных ID: {df['id'].nunique()}")
+        
+        # Показываем первые 2 записи каждого из первых 3 ID
+        unique_ids = df['id'].unique()[:3]
+        for uid in unique_ids:
+            print(f"\n--- ID {uid} ---")
+            examples = df[df['id'] == uid].head(2)
+            for _, row in examples.iterrows():
+                print(f"ОРИГИНАЛ: {row['original'][:80]}...")
+                print(f"РАЗМЕТКА: {row['annotated'][:80]}...")
+                print()
+                
+    except Exception as e:
+        print(f"Ошибка: {e}")
+
+if __name__ == "__main__":
+    filename = sys.argv[1] if len(sys.argv) > 1 else "messages.csv"
+    simple_check(filename)
