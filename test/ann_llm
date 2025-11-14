@@ -1,9 +1,8 @@
-edit
-
 import json
 import csv
 import time
 import re
+import ast
 from openai import OpenAI
 
 client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
@@ -22,6 +21,8 @@ def extract_clean_response(text):
     clean_text = re.sub(r'РАЗМЕЧЕННЫЙ ДИАЛОГ:?', '', clean_text, flags=re.IGNORECASE)
     clean_text = re.sub(r'РАЗМЕЧЕННЫЙ ТЕКСТ:?', '', clean_text, flags=re.IGNORECASE)
     clean_text = re.sub(r'АННОТИРОВАННЫЙ ТЕКСТ:?', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'CSV:?', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'JSON:?', '', clean_text, flags=re.IGNORECASE)
     
     # Убираем лишние пробелы и переносы
     clean_text = re.sub(r'\n+', ' ', clean_text)
@@ -29,15 +30,84 @@ def extract_clean_response(text):
     
     return clean_text.strip()
 
-def create_message_prompt(message_text):
-    """Промпт для одного сообщения"""
+def create_dialog_prompt(dialog_messages):
+    """Промпт для всего диалога с возвратом в CSV формате"""
+    messages_text = "\n".join([f"{i+1}. {msg['text']}" for i, msg in enumerate(dialog_messages)])
+    
     return f'''
-Замени персональные данные на метки [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL] в этом тексте:
+Перед тобой диалог из {len(dialog_messages)} сообщений. Замени все персональные данные в КАЖДОМ сообщении на соответствующие метки:
 
-{message_text}
+[FIO] - ФИО, имена, фамилии, отчества
+[LOC] - адреса, местоположения, города
+[PHONE_NUM] - номера телефонов
+[LK_NUM] - номера личных карт, договоров, счетов
+[EMAIL] - email адреса
 
-Ответ (только текст с метками, без пояснений):
+Диалог:
+{messages_text}
+
+Верни ТОЛЬКО CSV формат со следующими колонками:
+message_id,original_text,annotated_text
+
+Где:
+- message_id: номер сообщения (1, 2, 3...)
+- original_text: оригинальный текст сообщения
+- annotated_text: текст с замененными персональными данными
+
+Пример:
+1,"Иванов Иван приедет по адресу Ленина 25","[FIO] приедет по адресу [LOC]"
+2,"Мой телефон 89151234567","Мой телефон [PHONE_NUM]"
+
+Твой ответ (только CSV, без пояснений):
 '''
+
+def parse_csv_response(response_text, dialog_messages):
+    """Парсит CSV ответ от модели и валидирует его"""
+    try:
+        # Очищаем ответ
+        clean_response = extract_clean_response(response_text)
+        
+        # Разбиваем на строки
+        lines = [line.strip() for line in clean_response.split('\n') if line.strip()]
+        
+        results = []
+        
+        for line in lines:
+            # Пропускаем заголовок если есть
+            if line.lower().startswith('message_id') or line.lower().startswith('id'):
+                continue
+                
+            # Парсим CSV строку
+            if line.count(',') >= 2:
+                parts = line.split(',', 2)
+                if len(parts) >= 3:
+                    message_id = parts[0].strip()
+                    original_text = parts[1].strip().strip('"')
+                    annotated_text = parts[2].strip().strip('"')
+                    
+                    # Валидация message_id
+                    try:
+                        msg_id = int(message_id)
+                        if 1 <= msg_id <= len(dialog_messages):
+                            results.append({
+                                'message_id': msg_id,
+                                'original_text': original_text,
+                                'annotated_text': annotated_text
+                            })
+                    except ValueError:
+                        continue
+        
+        # Проверяем, что получили все сообщения
+        if len(results) == len(dialog_messages):
+            # Сортируем по message_id
+            results.sort(key=lambda x: x['message_id'])
+            return results
+        
+        return None
+        
+    except Exception as e:
+        print(f"Ошибка парсинга CSV: {e}")
+        return None
 
 def main():
     # Настройки
@@ -53,216 +123,131 @@ def main():
     
     # Создаем CSV файл
     with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['id', 'original_message', 'annotated_message']
+        fieldnames = ['dialog_id', 'message_id', 'original_message', 'annotated_message']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         
         writer.writeheader()
         
+        total_dialogs = 0
         total_messages = 0
-        success_count = 0
+        success_dialogs = 0
+        success_messages = 0
         
         # Обработка диалогов
         for i, dialog in enumerate(dataset[:max_dialogs]):
             print(f"Обработка диалога {i+1}/{min(len(dataset), max_dialogs)} (ID: {dialog['id']})")
             
-            # Обрабатываем каждое сообщение отдельно
-            for message in dialog['dialogue']:
-                original_text = message['text']
+            dialog_id = dialog['id']
+            dialog_messages = dialog['dialogue']
+            
+            # Подготавливаем сообщения диалога
+            prepared_messages = []
+            for msg in dialog_messages:
+                clean_text = re.sub(r'\n+', ' ', msg['text'])
+                clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                prepared_messages.append({'text': clean_text})
+            
+            try:
+                # Отправляем весь диалог одним запросом
+                response = client.chat.completions.create(
+                    model="Qwen3-8B-AWQ",
+                    messages=[{
+                        "role": "user", 
+                        "content": create_dialog_prompt(prepared_messages)
+                    }],
+                    temperature=0.1,
+                    max_tokens=4000
+                )
                 
-                # Очищаем оригинальный текст от переносов
-                clean_original = re.sub(r'\n+', ' ', original_text)
-                clean_original = re.sub(r'\s+', ' ', clean_original).strip()
+                result_text = response.choices[0].message.content
                 
-                try:
-                    # Отправляем запрос для одного сообщения
-                    response = client.chat.completions.create(
-                        model="Qwen3-8B-AWQ",
-                        messages=[{
-                            "role": "user", 
-                            "content": create_message_prompt(clean_original)
-                        }],
-                        temperature=0.1,
-                        max_tokens=2000
-                    )
+                # Парсим CSV ответ
+                parsed_results = parse_csv_response(result_text, prepared_messages)
+                
+                if parsed_results:
+                    # Успешно распарсили CSV
+                    for result in parsed_results:
+                        writer.writerow({
+                            'dialog_id': dialog_id,
+                            'message_id': result['message_id'],
+                            'original_message': result['original_text'],
+                            'annotated_message': result['annotated_text']
+                        })
+                        success_messages += 1
+                        total_messages += 1
                     
-                    result_text = response.choices[0].message.content
+                    success_dialogs += 1
+                    print(f"  ✓ Диалог обработан целиком ({len(parsed_results)} сообщений)")
                     
-                    # Очищаем ответ
-                    clean_response = extract_clean_response(result_text)
+                else:
+                    # Не удалось распарсить CSV - обрабатываем каждое сообщение отдельно
+                    print(f"  ⚠ CSV парсинг не удался, обрабатываю сообщения по отдельности")
                     
-                    # Сохраняем в CSV
+                    for j, message in enumerate(prepared_messages):
+                        original_text = message['text']
+                        
+                        try:
+                            single_response = client.chat.completions.create(
+                                model="Qwen3-8B-AWQ",
+                                messages=[{
+                                    "role": "user", 
+                                    "content": f'Замени персональные данные на метки [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL] в этом тексте: {original_text}\n\nОтвет (только текст с метками, без пояснений):'
+                                }],
+                                temperature=0.1,
+                                max_tokens=2000
+                            )
+                            
+                            single_result = single_response.choices[0].message.content
+                            clean_single_result = extract_clean_response(single_result)
+                            
+                            writer.writerow({
+                                'dialog_id': dialog_id,
+                                'message_id': j + 1,
+                                'original_message': original_text,
+                                'annotated_message': clean_single_result
+                            })
+                            
+                            success_messages += 1
+                            total_messages += 1
+                            print(f"    ✓ Сообщение {j+1} обработано")
+                            
+                        except Exception as e:
+                            print(f"    ✗ Ошибка в сообщении {j+1}: {str(e)}")
+                            writer.writerow({
+                                'dialog_id': dialog_id,
+                                'message_id': j + 1,
+                                'original_message': original_text,
+                                'annotated_message': f"ОШИБКА: {str(e)}"
+                            })
+                            total_messages += 1
+                        
+                        time.sleep(0.2)
+                
+                total_dialogs += 1
+                
+            except Exception as e:
+                print(f"  ✗ Ошибка в диалоге: {str(e)}")
+                # Сохраняем все сообщения с пометкой об ошибке
+                for j, message in enumerate(prepared_messages):
                     writer.writerow({
-                        'id': dialog['id'],
-                        'original_message': clean_original,
-                        'annotated_message': clean_response
-                    })
-                    
-                    success_count += 1
-                    total_messages += 1
-                    
-                    print(f"  ✓ Сообщение {total_messages} обработано")
-                    
-                except Exception as e:
-                    print(f"  ✗ Ошибка в сообщении: {str(e)}")
-                    
-                    # Сохраняем оригинал с пометкой об ошибке
-                    writer.writerow({
-                        'id': dialog['id'],
-                        'original_message': clean_original,
-                        'annotated_message': f"ОШИБКА: {str(e)}"
+                        'dialog_id': dialog_id,
+                        'message_id': j + 1,
+                        'original_message': message['text'],
+                        'annotated_message': f"ОШИБКА ДИАЛОГА: {str(e)}"
                     })
                     total_messages += 1
                 
-                # Пауза между запросами
-                time.sleep(0.5)
+                total_dialogs += 1
+            
+            # Пауза между диалогами
+            time.sleep(1)
     
     print(f"\n=== ИТОГ ===")
+    print(f"Обработано диалогов: {total_dialogs}")
+    print(f"Успешных диалогов: {success_dialogs}")
     print(f"Обработано сообщений: {total_messages}")
-    print(f"Успешно: {success_count}")
+    print(f"Успешных сообщений: {success_messages}")
     print(f"Файл сохранен: {output_file}")
-
-if __name__ == "__main__":
-    main()
-
-
------------
-
-import json
-import time
-from openai import OpenAI
-
-# Настройка подключения к vLLM серверу
-client = OpenAI(
-    api_key="EMPTY",
-    base_url="http://localhost:8000/v1"
-)
-
-def load_dataset(filename):
-    """Загрузка датасета"""
-    with open(filename, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-def save_progress(annotated_data, filename):
-    """Сохранение прогресса"""
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(annotated_data, f, ensure_ascii=False, indent=2)
-
-def create_system_prompt():
-    """Создание системного промпта с инструкциями"""
-    return """Ты - ассистент для разметки персональных данных в диалогах технической поддержки.
-    
-ЗАДАЧА: Найди и замени все персональные данные в диалоге на соответствующие метки.
-
-МЕТКИ ДЛЯ ЗАМЕНЫ:
-- ФИО (полное или части) → [FIO]
-- Место жительства (город, адрес) → [LOC] 
-- Номер телефона → [PHONE_NUM]
-- Email адрес → [EMAIL]
-
-ПРАВИЛА:
-1. Сохрани исходную структуру диалога
-2. Заменяй ТОЛЬКО персональные данные, остальной текст оставляй без изменений
-3. Используй метки точно как указано выше
-4. Возвращай ТОЛЬКО размеченный диалог в формате JSON без дополнительных объяснений
-
-ПРИМЕР РАЗМЕТКИ:
-Вход: "Меня зовут Иван Иванов, телефон 89161234567, email ivan@mail.ru"
-Выход: "Меня зовут [FIO], телефон [PHONE_NUM], email [EMAIL]"
-"""
-
-def annotate_dialogue(dialogue):
-    """Разметка одного диалога с помощью модели"""
-    
-    # Формируем текст диалога для обработки
-    dialogue_text = ""
-    for message in dialogue:
-        dialogue_text += f"{message['role']}: {message['text']}\n"
-    
-    user_prompt = f"""
-    Разметь следующий диалог, заменив персональные данные на метки:
-    
-    {dialogue_text}
-    
-    Верни ТОЛЬКО размеченный диалог в том же формате (список словарей с role и text).
-    """
-    
-    try:
-        response = client.chat.completions.create(
-            model="Qwen/Qwen3-8B-AWQ",
-            messages=[
-                {"role": "system", "content": create_system_prompt()},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=4000
-        )
-        
-        result = response.choices[0].message.content
-        
-        # Парсим ответ модели (может быть JSON или текстом)
-        try:
-            # Пытаемся распарсить как JSON
-            annotated_dialogue = json.loads(result)
-            return annotated_dialogue
-        except json.JSONDecodeError:
-            # Если не JSON, пытаемся извлечь структуру другим способом
-            print(f"Модель вернула не JSON. Ответ: {result}")
-            return None
-            
-    except Exception as e:
-        print(f"Ошибка при запросе к модели: {e}")
-        return None
-
-def main():
-    # Настройки
-    input_file = "your_dataset.json"  # Ваш исходный файл
-    output_file = "annotated_dataset.json"  # Файл для результатов
-    start_index = 0  # С какого диалога начать
-    max_dialogs = 2000  # Сколько диалогов обработать
-    
-    # Загрузка датасета
-    dataset = load_dataset(input_file)
-    print(f"Загружено диалогов: {len(dataset)}")
-    
-    # Загрузка существующих результатов (если продолжаем)
-    try:
-        annotated_data = load_dataset(output_file)
-        print(f"Найдены существующие результаты: {len(annotated_data)} диалогов")
-    except FileNotFoundError:
-        annotated_data = []
-        print("Начинаем новую разметку...")
-    
-    # Определяем диапазон для обработки
-    end_index = min(start_index + max_dialogs, len(dataset))
-    
-    # Обработка диалогов
-    for i in range(start_index, end_index):
-        original_dialog = dataset[i]
-        print(f"Обработка диалога {i+1}/{len(dataset)} (ID: {original_dialog['id']})")
-        
-        # Разметка диалога
-        annotated_dialogue = annotate_dialogue(original_dialog['dialogue'])
-        
-        if annotated_dialogue:
-            # Создаем размеченный диалог
-            annotated_dialog = original_dialog.copy()
-            annotated_dialog['dialogue'] = annotated_dialogue
-            annotated_dialog['annotated'] = True  # Помечаем как размеченный
-            annotated_dialog['annotation_timestamp'] = time.time()
-            
-            annotated_data.append(annotated_dialog)
-            
-            # Сохраняем прогресс после каждого диалога
-            save_progress(annotated_data, output_file)
-            print(f"✓ Диалог {i+1} размечен и сохранен")
-        else:
-            print(f"✗ Ошибка разметки диалога {i+1}")
-        
-        # Небольшая пауза между запросами
-        time.sleep(1)
-    
-    print(f"Готово! Обработано {len(annotated_data)} диалогов")
-    print(f"Результаты сохранены в {output_file}")
 
 if __name__ == "__main__":
     main()
