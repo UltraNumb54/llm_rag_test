@@ -1,349 +1,195 @@
-import json
 import csv
 import time
 import re
-import asyncio
-import aiohttp
-from datetime import datetime
-import logging
-from typing import List, Dict, Any
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from openai import OpenAI
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f"vllm_processing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-        logging.StreamHandler()
-    ]
-)
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1")
 
-class ParallelDialogProcessor:
-    def __init__(self, base_url: str = "http://localhost:8000/v1", max_concurrent: int = 8):
-        self.base_url = base_url
-        self.max_concurrent = max_concurrent
-        self.session = None
-        
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-        
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+def extract_clean_response(text):
+    """Извлекает чистый ответ, убирая всё лишнее"""
+    if text is None:
+        return ""
 
-    def extract_clean_response(self, text: str) -> str:
-        """Извлекает чистый ответ, убирая всё лишнее"""
-        if text is None:
-            return ""
-        
-        # Удаляем все теги форматирования и размышления
-        clean_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        clean_text = re.sub(r'\*\*.*?\*\*', '', clean_text)
-        clean_text = re.sub(r'\*.*?\*', '', clean_text)
-        clean_text = re.sub(r'`.*?`', '', clean_text)
-        clean_text = re.sub(r'#+', '', clean_text)
-        clean_text = re.sub(r'РАЗМЕЧЕННЫЙ ДИАЛОГ:?', '', clean_text, flags=re.IGNORECASE)
-        clean_text = re.sub(r'РАЗМЕЧЕННЫЙ ТЕКСТ:?', '', clean_text, flags=re.IGNORECASE)
-        clean_text = re.sub(r'АННОТИРОВАННЫЙ ТЕКСТ:?', '', clean_text, flags=re.IGNORECASE)
-        clean_text = re.sub(r'CSV:?', '', clean_text, flags=re.IGNORECASE)
-        clean_text = re.sub(r'JSON:?', '', clean_text, flags=re.IGNORECASE)
-        
-        # Убираем лишние пробелы и переносы
-        clean_text = re.sub(r'\n+', ' ', clean_text)
-        clean_text = re.sub(r'\s+', ' ', clean_text)
-        
-        return clean_text.strip()
+    # Удаляем все теги форматирования и размышления
+    clean_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    clean_text = re.sub(r'\*\*.*?\*\*', '', clean_text)  # Жирный текст
+    clean_text = re.sub(r'\*.*?\*', '', clean_text)      # Курсив
+    clean_text = re.sub(r'`.*?`', '', clean_text)        # Код
+    clean_text = re.sub(r'#+', '', clean_text)           # Заголовки
+    clean_text = re.sub(r'РАЗМЕЧЕННЫЙ ДИАЛОГ:?', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'РАЗМЕЧЕННЫЙ ТЕКСТ:?', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'АННОТИРОВАННЫЙ ТЕКСТ:?', '', clean_text, flags=re.IGNORECASE)
 
-    def create_dialog_prompt(self, dialog_messages: List[Dict]) -> str:
-        """Промпт для всего диалога с возвратом в CSV формате"""
-        messages_text = "\n".join([msg['text'] for msg in dialog_messages])
-        
-        return f'''
-Перед тобой диалог из {len(dialog_messages)} сообщений. Замени все персональные данные в КАЖДОМ сообщении на соответствующие метки:
+    # Убираем лишние пробелы и переносы
+    clean_text = re.sub(r'\n+', ' ', clean_text)
+    clean_text = re.sub(r'\s+', ' ', clean_text)
 
-[FIO] - ФИО, имена, фамилии, отчества
-[LOC] - адреса, местоположения, города
-[PHONE_NUM] - номера телефонов
-[LK_NUM] - номера личных карт, договоров, счетов
-[EMAIL] - email адреса
+    return clean_text.strip()
 
-Диалог:
-{messages_text}
+def create_dialog_prompt(dialog_text):
+    """Промпт для всего диалога"""
+    return f'''
+Замени персональные данные на метки [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL] в этом диалоге:
 
-Верни ТОЛЬКО CSV формат со следующими колонками:
-original_text,annotated_text
+{dialog_text}
 
-Где:
-- original_text: оригинальный текст сообщения
-- annotated_text: текст с замененными персональными данными
-
-Пример:
-"Иванов Иван приедет по адресу Ленина 25","[FIO] приедет по адресу [LOC]"
-"Мой телефон 89151234567","Мой телефон [PHONE_NUM]"
-
-Твой ответ (только CSV, без пояснений):
+Верни тот же диалог, но с заменёнными персональными данными на соответствующие метки.
+Сохрани всю структуру диалога и все остальные слова без изменений.
+Ответ (только размеченный диалог, без пояснений):
 '''
 
-    def parse_csv_response(self, response_text: str, dialog_messages: List[Dict], dialog_id: str) -> List[Dict]:
-        """Парсит CSV ответ от модели и валидирует его с логированием"""
-        # ВСЕГДА логируем сырой ответ
-        logging.info(f"=== СЫРОЙ ОТВЕТ МОДЕЛИ ДЛЯ ДИАЛОГА {dialog_id} ===")
-        logging.info(response_text)
-        logging.info("=== КОНЕЦ СЫРОГО ОТВЕТА ===")
+def process_dialog_batch(dialog_batch):
+    """Обрабатывает батч диалогов параллельно"""
+    results = []
+    
+    for dialog_data in dialog_batch:
+        dialog_id = dialog_data['id']
+        dialog_messages = dialog_data['dialogue']
+        
+        # Собираем весь диалог в один текст
+        dialog_text = "\n".join([f"{i+1}. {msg['text']}" for i, msg in enumerate(dialog_messages)])
+        
+        print(f"\n=== ЗАПРОС ДЛЯ ДИАЛОГА {dialog_id} ===")
+        print(f"Промпт: {create_dialog_prompt(dialog_text)}")
+        print("=" * 50)
         
         try:
-            # Очищаем ответ
-            clean_response = self.extract_clean_response(response_text)
-            
-            # Разбиваем на строки
-            lines = [line.strip() for line in clean_response.split('\n') if line.strip()]
-            
-            results = []
-            
-            for line in lines:
-                # Пропускаем заголовок если есть
-                if line.lower().startswith('original_text') or line.lower().startswith('annotated_text'):
-                    continue
-                    
-                # Парсим CSV строку
-                if line.count(',') >= 1:
-                    parts = line.split(',', 1)
-                    if len(parts) >= 2:
-                        original_text = parts[0].strip().strip('"')
-                        annotated_text = parts[1].strip().strip('"')
-                        
-                        results.append({
-                            'original_text': original_text,
-                            'annotated_text': annotated_text
-                        })
-            
-            # Проверяем, что получили все сообщения
-            if len(results) == len(dialog_messages):
-                logging.info(f"✓ Успешно распарсено {len(results)} сообщений для диалога {dialog_id}")
-                return results
-            else:
-                logging.warning(f"⚠ Несоответствие количества сообщений: ожидалось {len(dialog_messages)}, получено {len(results)} для диалога {dialog_id}")
-                return None
-                
-        except Exception as e:
-            logging.error(f"✗ Ошибка парсинга CSV для диалога {dialog_id}: {e}")
-            return None
-
-    async def process_single_dialog(self, dialog: Dict) -> List[Dict]:
-        """Обрабатывает один диалог"""
-        dialog_id = dialog['id']
-        dialog_messages = dialog['dialogue']
-        
-        # Подготавливаем сообщения диалога
-        prepared_messages = []
-        for msg in dialog_messages:
-            clean_text = re.sub(r'\n+', ' ', msg['text'])
-            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-            prepared_messages.append({'text': clean_text})
-        
-        try:
-            # Отправляем весь диалог одним запросом
-            payload = {
-                "model": "Qwen3-8B-AWQ",
-                "messages": [{
-                    "role": "user", 
-                    "content": self.create_dialog_prompt(prepared_messages)
+            # Отправляем запрос для всего диалога
+            response = client.chat.completions.create(
+                model="Qwen3-8B-AWQ",
+                messages=[{
+                    "role": "user",
+                    "content": create_dialog_prompt(dialog_text)
                 }],
-                "temperature": 0.1,
-                "max_tokens": 4000
-            }
-            
-            async with self.session.post(f"{self.base_url}/chat/completions", json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    result_text = result['choices'][0]['message']['content']
-                    
-                    # Парсим CSV ответ
-                    parsed_results = self.parse_csv_response(result_text, prepared_messages, dialog_id)
-                    
-                    if parsed_results:
-                        # Форматируем результаты
-                        formatted_results = []
-                        for result in parsed_results:
-                            formatted_results.append({
-                                'dialog_id': dialog_id,
-                                'original_message': result['original_text'],
-                                'annotated_message': result['annotated_text']
-                            })
-                        return formatted_results
-                    else:
-                        # Fallback: обработка сообщений по одному
-                        logging.info(f"⚡ Запуск fallback обработки для диалога {dialog_id}")
-                        return await self.process_messages_fallback(dialog_id, prepared_messages)
-                else:
-                    error_text = await response.text()
-                    logging.error(f"HTTP ошибка {response.status} для диалога {dialog_id}: {error_text}")
-                    return self.create_error_results(dialog_id, prepared_messages, f"HTTP {response.status}")
-                    
-        except Exception as e:
-            logging.error(f"Ошибка обработки диалога {dialog_id}: {str(e)}")
-            return self.create_error_results(dialog_id, prepared_messages, str(e))
+                temperature=0.1,
+                max_tokens=4000  # Увеличиваем для длинных диалогов
+            )
 
-    async def process_messages_fallback(self, dialog_id: str, messages: List[Dict]) -> List[Dict]:
-        """Fallback: обработка сообщений по одному"""
-        results = []
-        
-        # Создаем задачи для параллельной обработки сообщений
-        tasks = []
-        for message in messages:
-            task = self.process_single_message(dialog_id, message['text'])
-            tasks.append(task)
-        
-        # Ограничиваем параллелизм для fallback
-        semaphore = asyncio.Semaphore(4)  # Меньше параллелизма для стабильности
-        
-        async def bounded_task(task):
-            async with semaphore:
-                return await task
-        
-        bounded_tasks = [bounded_task(task) for task in tasks]
-        message_results = await asyncio.gather(*bounded_tasks, return_exceptions=True)
-        
-        for i, result in enumerate(message_results):
-            if isinstance(result, Exception):
-                logging.error(f"Ошибка в сообщении {i+1} диалога {dialog_id}: {str(result)}")
+            result_text = response.choices[0].message.content
+            
+            print(f"\n=== ОТВЕТ ДЛЯ ДИАЛОГА {dialog_id} ===")
+            print(f"Полный ответ: {result_text}")
+            print("=" * 50)
+            
+            # Очищаем ответ
+            clean_response = extract_clean_response(result_text)
+            
+            # Разбиваем ответ на отдельные сообщения
+            annotated_messages = []
+            lines = clean_response.split('\n')
+            for line in lines:
+                # Ищем строки с номерами сообщений
+                match = re.match(r'^\d+\.\s*(.+)$', line.strip())
+                if match:
+                    annotated_messages.append(match.group(1))
+            
+            # Если не удалось разбить на сообщения, используем весь ответ для всех сообщений
+            if len(annotated_messages) != len(dialog_messages):
+                print(f"Предупреждение: количество размеченных сообщений ({len(annotated_messages)}) не совпадает с оригинальным ({len(dialog_messages)})")
+                # Используем тот же размеченный текст для всех сообщений
+                annotated_messages = [clean_response] * len(dialog_messages)
+            
+            # Сохраняем результаты для каждого сообщения
+            for i, message in enumerate(dialog_messages):
+                original_text = message['text']
+                clean_original = re.sub(r'\n+', ' ', original_text)
+                clean_original = re.sub(r'\s+', ' ', clean_original).strip()
+                
+                annotated_text = annotated_messages[i] if i < len(annotated_messages) else clean_response
+                
                 results.append({
                     'dialog_id': dialog_id,
-                    'original_message': messages[i]['text'],
-                    'annotated_message': f"ОШИБКА: {str(result)}"
+                    'original_message': clean_original,
+                    'annotated_message': annotated_text
                 })
-            else:
-                results.append(result)
-        
-        return results
-
-    async def process_single_message(self, dialog_id: str, message_text: str) -> Dict:
-        """Обрабатывает одно сообщение"""
-        try:
-            payload = {
-                "model": "Qwen3-8B-AWQ",
-                "messages": [{
-                    "role": "user", 
-                    "content": f'Замени персональные данные на метки [FIO], [LOC], [PHONE_NUM], [LK_NUM], [EMAIL] в этом тексте: {message_text}\n\nОтвет (только текст с метками, без пояснений):'
-                }],
-                "temperature": 0.1,
-                "max_tokens": 2000
-            }
-            
-            async with self.session.post(f"{self.base_url}/chat/completions", json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    result_text = result['choices'][0]['message']['content']
-                    clean_result = self.extract_clean_response(result_text)
-                    
-                    return {
-                        'dialog_id': dialog_id,
-                        'original_message': message_text,
-                        'annotated_message': clean_result
-                    }
-                else:
-                    return {
-                        'dialog_id': dialog_id,
-                        'original_message': message_text,
-                        'annotated_message': f"HTTP ошибка {response.status}"
-                    }
-                    
+                
         except Exception as e:
-            return {
-                'dialog_id': dialog_id,
-                'original_message': message_text,
-                'annotated_message': f"ОШИБКА: {str(e)}"
-            }
+            print(f"Ошибка в диалоге {dialog_id}: {str(e)}")
+            # Сохраняем оригиналы с пометкой об ошибке
+            for message in dialog_messages:
+                original_text = message['text']
+                clean_original = re.sub(r'\n+', ' ', original_text)
+                clean_original = re.sub(r'\s+', ' ', clean_original).strip()
+                
+                results.append({
+                    'dialog_id': dialog_id,
+                    'original_message': clean_original,
+                    'annotated_message': f"ОШИБКА: {str(e)}"
+                })
+    
+    return results
 
-    def create_error_results(self, dialog_id: str, messages: List[Dict], error: str) -> List[Dict]:
-        """Создает результаты с ошибкой для всего диалога"""
-        return [{
-            'dialog_id': dialog_id,
-            'original_message': msg['text'],
-            'annotated_message': f"ОШИБКА ДИАЛОГА: {error}"
-        } for msg in messages]
-
-    async def process_dialogs_parallel(self, dialogs: List[Dict], output_file: str, max_dialogs: int = None):
-        """Основная функция параллельной обработки"""
-        if max_dialogs:
-            dialogs = dialogs[:max_dialogs]
-        
-        # Создаем CSV файл
-        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['dialog_id', 'original_message', 'annotated_message']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-            writer.writeheader()
-            
-            total_processed = 0
-            success_dialogs = 0
-            
-            # Обрабатываем диалоги батчами
-            batch_size = self.max_concurrent
-            for i in range(0, len(dialogs), batch_size):
-                batch = dialogs[i:i + batch_size]
-                logging.info(f"Обработка батча {i//batch_size + 1}/{(len(dialogs)-1)//batch_size + 1}")
-                
-                # Создаем задачи для текущего батча
-                tasks = [self.process_single_dialog(dialog) for dialog in batch]
-                
-                # Ограничиваем параллелизм семафором
-                semaphore = asyncio.Semaphore(self.max_concurrent)
-                
-                async def bounded_task(task):
-                    async with semaphore:
-                        return await task
-                
-                bounded_tasks = [bounded_task(task) for task in tasks]
-                batch_results = await asyncio.gather(*bounded_tasks, return_exceptions=True)
-                
-                # Записываем результаты
-                for j, dialog_result in enumerate(batch_results):
-                    dialog_id = batch[j]['id']
-                    
-                    if isinstance(dialog_result, Exception):
-                        logging.error(f"Ошибка в диалоге {dialog_id}: {str(dialog_result)}")
-                        # Создаем ошибки для всех сообщений диалога
-                        error_results = self.create_error_results(
-                            dialog_id, 
-                            batch[j]['dialogue'], 
-                            str(dialog_result)
-                        )
-                        for result in error_results:
-                            writer.writerow(result)
-                            total_processed += 1
-                    else:
-                        for result in dialog_result:
-                            writer.writerow(result)
-                            total_processed += 1
-                        success_dialogs += 1
-                        logging.info(f"✓ Завершен диалог {dialog_id}")
-                
-                # Пауза между батчами
-                await asyncio.sleep(1)
-            
-            logging.info(f"\n=== ИТОГ ===")
-            logging.info(f"Обработано диалогов: {len(dialogs)}")
-            logging.info(f"Успешных диалогов: {success_dialogs}")
-            logging.info(f"Обработано сообщений: {total_processed}")
-            logging.info(f"Файл сохранен: {output_file}")
-
-async def main():
+def main():
     # Настройки
     input_file = "your_dataset.json"
-    output_file = f"annotated_messages_parallel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    output_file = "annotated_dialogs.csv"
     max_dialogs = 2000
-    max_concurrent = 8  # Оптимально для 16 ГБ GPU
+    batch_size = 8  # Количество параллельных запросов
     
     # Загрузка датасета
     with open(input_file, 'r', encoding='utf-8') as f:
         dataset = json.load(f)
+
+    print(f"Загружено диалогов: {len(dataset)}")
     
-    logging.info(f"Загружено диалогов: {len(dataset)}")
+    # Ограничиваем количество обрабатываемых диалогов
+    dialogs_to_process = dataset[:max_dialogs]
     
-    # Создаем и запускаем процессор
-    async with ParallelDialogProcessor(max_concurrent=max_concurrent) as processor:
-        await processor.process_dialogs_parallel(dataset, output_file, max_dialogs)
+    # Создаем CSV файл
+    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['dialog_id', 'original_message', 'annotated_message']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        writer.writeheader()
+        
+        total_processed = 0
+        success_count = 0
+        
+        # Разбиваем на батчи
+        batches = [dialogs_to_process[i:i + batch_size] for i in range(0, len(dialogs_to_process), batch_size)]
+        
+        for batch_num, batch in enumerate(batches):
+            print(f"\nОбработка батча {batch_num + 1}/{len(batches)} (размер: {len(batch)})")
+            
+            # Обрабатываем батч параллельно
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                # Запускаем обработку батча
+                future = executor.submit(process_dialog_batch, batch)
+                
+                try:
+                    batch_results = future.result(timeout=300)  # Таймаут 5 минут на батч
+                    
+                    # Записываем результаты
+                    for result in batch_results:
+                        writer.writerow(result)
+                        success_count += 1
+                    
+                    total_processed += len(batch)
+                    print(f"Батч {batch_num + 1} обработан успешно. Сообщений: {len(batch_results)}")
+                    
+                except Exception as e:
+                    print(f"Ошибка при обработке батча {batch_num + 1}: {str(e)}")
+                    # В случае ошибки батча, сохраняем оригиналы
+                    for dialog in batch:
+                        for message in dialog['dialogue']:
+                            original_text = message['text']
+                            clean_original = re.sub(r'\n+', ' ', original_text)
+                            clean_original = re.sub(r'\s+', ' ', clean_original).strip()
+                            
+                            writer.writerow({
+                                'dialog_id': dialog['id'],
+                                'original_message': clean_original,
+                                'annotated_message': f"ОШИБКА БАТЧА: {str(e)}"
+                            })
+            
+            # Пауза между батчами чтобы не перегружать систему
+            time.sleep(1)
+    
+    print(f"\n=== ИТОГ ===")
+    print(f"Обработано диалогов: {total_processed}")
+    print(f"Успешно размеченных сообщений: {success_count}")
+    print(f"Файл сохранен: {output_file}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
