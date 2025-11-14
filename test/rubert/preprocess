@@ -5,7 +5,7 @@ from datasets import Dataset, ClassLabel, Sequence
 from typing import List, Dict
 
 # Загрузка токенизатора для выбранной модели
-model_name = "cointegrated/rubert-tiny2"
+model_name = "DeepPavlov/rubert-base-cased" 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 def parse_annotated_message(text: str, labels_dict: Dict[str, str]) -> List[tuple]:
